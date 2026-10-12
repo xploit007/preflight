@@ -48,7 +48,7 @@ What `/scan` does:
 2. For every `warn` and `manual` result, reads the code at the evidence lines and answers that result's precise question (confirmed, not an issue, or needs the owner). It doesn't re-scan the repo by eye.
 3. Writes `preflight-report.md` in the scanned repo: findings ordered by severity, each with `file:line` evidence and a concrete fix, plus a to-do list for dashboard-only items such as spend caps.
 
-It reports first and never fixes without asking. It doesn't run destructive or active tests: the only network calls are `npm audit` and, when you pass the flags, one read-only GET per live check.
+It reports first and never fixes without asking. It doesn't run destructive or active tests. The only network calls are `npm audit` and, when you pass `--url` or `--supabase-url`, a handful of read-only GET requests: the page itself, one CORS probe, the http→https redirect check, and one `?limit=1` read per table.
 
 ### CLI options
 
