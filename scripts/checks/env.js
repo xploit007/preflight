@@ -8,6 +8,7 @@
 const { loadRepo } = require('../lib/repo');
 const P = require('../lib/patterns');
 const { pass, fail, warn, na, ev } = require('../lib/result');
+const { entropy } = require('../lib/util');
 
 const IDS = ['SEC-02', 'SEC-08'];
 
@@ -61,6 +62,14 @@ function strongLabel(e) {
   return null;
 }
 
+/** Example-file values that match no provider format but look like a real random secret. */
+function randomLooking(e) {
+  const v = e.value;
+  if (!v || P.isPlaceholder(v) || P.PUBLIC_VALUE_RE.test(v) || !SECRETISH_NAME_RE.test(e.name) || P.PUBLIC_NAME_RE.test(e.name)) return false;
+  if (v.length < 24 || /\s/.test(v) || /^https?:\/\//i.test(v) || /^[a-z]+(?:[_-][a-z0-9]+)+$/i.test(v)) return false; // words-with-dashes placeholders
+  return entropy(v) >= 3.5;
+}
+
 function envFilesCheck(repo) {
   const files = repo.envFiles();
   if (!files.length) return na('SEC-02', 'no .env files in the repo');
@@ -76,7 +85,9 @@ function envFilesCheck(repo) {
     const line = secrets.length ? secrets[0].e.line : 1;
     const holds = secrets.length ? `holds ${secrets.length} secret-looking value${secrets.length > 1 ? 's' : ''} (first: ${secrets[0].label}, line ${secrets[0].e.line})` : 'holds no secret-looking values right now';
     if (example) {
+      const odd = secrets.length ? [] : entries.filter(randomLooking);
       if (secrets.length) failing.push(ev(f.rel, line, `example env file contains a real-looking secret (${secrets[0].label}); example files are committed and public`));
+      else if (odd.length) warning.push(ev(f.rel, odd[0].line, `example env file has a random-looking ${odd.map((e) => e.name).slice(0, 3).join(', ')} value; if it was ever used for real, rotate it (example files are committed and public)`));
       else fine.push(ev(f.rel, null, 'example file with placeholders only (fine to commit)'));
       continue;
     }

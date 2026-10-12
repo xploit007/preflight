@@ -1,6 +1,6 @@
 'use strict';
 
-const { entropy } = require('./util');
+const { entropy, splitArgs } = require('./util');
 
 /**
  * High-confidence secret formats. Each regex keys on a provider-specific prefix and shape,
@@ -63,6 +63,13 @@ const SECRET_PATTERNS = [
   { id: 'private-key', label: 'Private key block', re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----/g },
 ];
 
+/**
+ * Cheap prefilter: every string any pattern above (or JWT_RE / DB_URL_RE below) can match
+ * contains one of these. Lets the history scan skip most added lines with a single test.
+ * Keep it in sync when adding patterns (test/units.test.js checks it against a sample of each).
+ */
+const SECRET_HINT_RE = /AKIA|ASIA|ABIA|ACCA|[aA][wW][sS]_?[sS][eE][cC][rR][eE][tT]|_live_|_test_|whsec_|gh[pousr]_|github_pat_|glpat-|sk-|gsk_|r8_|hf_|xai-|pplx-|AIza|xox[baprs]-|:AA|SK[0-9a-f]{32}|SG\.|key-[0-9a-f]|npm_|_authToken|shp(?:at|ca|pa|ss)_|lin_api_|dp\.(?:pt|st|sa|ct)\.|pscale_|sk\.eyJ|sb_secret_|sbp_|PRIVATE KEY|eyJ|:\/\//;
+
 /** Documentation example values that are public on purpose. */
 const KNOWN_EXAMPLES = new Set(['AKIAIOSFODNN7EXAMPLE', 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY']);
 
@@ -78,17 +85,24 @@ const DB_URL_RE = /\b(postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|am
 /** Hosts that only make sense on a developer machine or inside docker-compose. */
 const LOCAL_HOST_RE = /^(?:localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|::1|\[::1\]|host\.docker\.internal|db|database|postgres|postgresql|mysql|mariadb|mongo|mongodb|redis|rabbitmq|cache|[\w-]+\.local|[\w-]+\.internal|[\w.-]+\.svc(?:\.cluster\.local)?)$/i;
 
+/** Words that make an identifier a credential name (api_key, clientSecret, password, secretOrKey…). */
+const SECRET_NAME_WORDS = 'api[_-]?key|apikey|secret(?:[_-]?key|OrKey|OrPrivateKey)?|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|private[_-]?key|password|passwd|signing[_-]?key|encryption[_-]?key|webhook[_-]?secret|bearer[_-]?token';
+
 /**
  * Generic `name = "value"` / `name: "value"` assignment where the name looks like a credential.
- * Group 1 name, 2 quote, 3 value (8–256 non-space chars).
+ * Group 1 name, 2 quote, 3 value (8–256 non-space chars). The name may be the bare word
+ * (`password: '…'`). The prefix is bounded ({0,40}) so long dotted/word runs in minified code
+ * can't make this quadratic.
  */
-// The name prefix is bounded ({0,40}) so long dotted/word runs in minified code can't make this quadratic.
-const GENERIC_ASSIGN_RE = /\b([A-Za-z_$][\w$.-]{0,40}?(?:api[_-]?key|apikey|secret(?:[_-]?key)?|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|private[_-]?key|password|passwd|signing[_-]?key|encryption[_-]?key|webhook[_-]?secret|bearer[_-]?token))\b["']?\s*(?::|=|:=|=>)\s*(["'`])([^"'`\s]{8,256})\2/gi;
+const GENERIC_ASSIGN_RE = new RegExp(`\\b((?:[A-Za-z_$][\\w$.-]{0,40}?)?(?:${SECRET_NAME_WORDS}))\\b["']?\\s*(?::|=|:=|=>)\\s*(["'\`])([^"'\`\\s]{8,256})\\2`, 'gi');
+
+/** Same idea for redaction only: any quoted value after a credential-ish name, spaces allowed. */
+const REDACT_ASSIGN_RE = new RegExp(`\\b((?:[A-Za-z_$][\\w$.-]{0,40}?)?(?:${SECRET_NAME_WORDS}|secret|token|pwd))\\b["']?\\s*(?::|=|:=|=>)\\s*(["'\`])((?:(?!\\2)[^\\n\\\\]|\\\\.){3,256})\\2`, 'gi');
 
 /** Names that look secret but are public by design. */
 const PUBLIC_NAME_RE = /(public|publishable|anon|site[_-]?key|client[_-]?id|recaptcha|measurement|pk_)/i;
 
-const PLACEHOLDER_RE = /^(?:\$\{|\{\{|<|\[|%|\*+$|x{3,}|\.{3})|process\.env|import\.meta|your[_-]|example|sample|placeholder|changeme|change[_-]?me|replace|dummy|todo|xxxx|redacted|insert[_-]|enter[_-]|lorem|undefined|^null$|^none$|^true$|^false$/i;
+const PLACEHOLDER_RE = /^(?:\$\{|\{\{|<|\[|%|\*+$|x{3,}|\.{3}|env\(|\$\()|\$\{|\{\{|process\.env|import\.meta|your[_-]|example|sample|placeholder|changeme|change[_-]?me|replace|dummy|todo|xxxx|redacted|insert[_-]|enter[_-]|lorem|undefined|^null$|^none$|^true$|^false$/i;
 
 /** Values that are public tokens by format (publishable keys, anon JWTs are checked separately). */
 const PUBLIC_VALUE_RE = /^(?:pk_(?:live|test)_|pk\.eyJ|sb_publishable_|phc_|G-[A-Z0-9]{6,}$|UA-\d|AIza)/;
@@ -149,9 +163,16 @@ function findSecrets(text) {
     }
   }
   for (const m of text.matchAll(JWT_RE)) {
-    if (supabaseRole(m[0]) === 'service_role') {
-      hits.push({ index: m.index, value: m[0], id: 'supabase-service-role', label: 'Supabase service_role key (JWT)', supabaseSecret: true });
-    }
+    if (supabaseRole(m[0]) !== 'service_role') continue;
+    // `supabase start` ships the same public demo keys to everyone (iss: supabase-demo).
+    const demo = /supabase-demo/.test(String((decodeJwt(m[0]) || {}).iss || ''));
+    hits.push({ index: m.index, value: m[0], id: 'supabase-service-role', label: demo ? 'Supabase local-dev service_role key (the public supabase-demo key; make sure no production key replaces it here)' : 'Supabase service_role key (JWT)', supabaseSecret: !demo, lowImpact: demo });
+  }
+  // PEM headers in tests and docs are often followed by a mock body; real keys carry long base64 lines.
+  for (let i = hits.length - 1; i >= 0; i--) {
+    if (hits[i].id !== 'private-key') continue;
+    const body = text.slice(hits[i].index + hits[i].value.length, hits[i].index + hits[i].value.length + 400).replace(/\\n|\\r/g, '\n');
+    if (!/[A-Za-z0-9+/=]{48,}/.test(body)) hits.splice(i, 1);
   }
   // The generic sk-<32 hex> shape can be a substring of nothing else; keep the earliest hit per index.
   hits.sort((a, b) => a.index - b.index);
@@ -191,9 +212,28 @@ function mask(value) {
   return `${prefix}${rest.slice(0, 2)}…${rest.slice(-2)}`;
 }
 
+/** Mask the string-literal secret argument of jwt.sign/verify and TextEncoder().encode(). */
+function maskSigningLiterals(line) {
+  let out = line;
+  for (const m of [...line.matchAll(/\b(?:jwt|jsonwebtoken|JWT|jws)\s*\.\s*(?:sign|verify)\s*\(|\bnew\s+TextEncoder\(\)\.encode\(/g)].reverse()) {
+    const call = splitArgs(line, m.index + m[0].length - 1);
+    const arg = call && (/TextEncoder/.test(m[0]) ? call.args[0] : call.args[1]);
+    if (!arg) continue;
+    const lit = /^(['"`])([\s\S]*)\1$/.exec(arg.text);
+    if (!lit || lit[2].includes('…') || lit[2].includes('${')) continue;
+    const at = out.indexOf(arg.text, arg.start);
+    if (at !== -1) out = `${out.slice(0, at)}${lit[1]}${mask(lit[2])}${lit[1]}${out.slice(at + arg.text.length)}`;
+  }
+  return out;
+}
+
+// Well-known default passwords: flagged by SEC-07 and shown as-is, since masking them hides nothing.
+const DEFAULT_PASSWORDS = new Set(['admin', 'admin123', 'admin1234', 'administrator', 'password', 'password1', 'password123', 'passw0rd', 'p@ssw0rd', 'changeme', 'changeit', 'default', 'root', 'toor', 'letmein', 'secret', '123456', '12345678', '123456789', 'qwerty', 'test', 'test123', 'guest', 'demo', 'example', 'postgres', 'mysql', 'minioadmin', 'pass', '1234', 'welcome', 'welcome1']);
+
 /** Mask every secret-looking token in a line of source before it goes into evidence. */
 function redact(line) {
-  const masked = (v) => String(v).includes('…');
+  // already masked by an earlier rule, or a well-known default that is clearer shown as-is
+  const keep = (v) => String(v).includes('…') || DEFAULT_PASSWORDS.has(String(v).toLowerCase());
   let out = String(line);
   for (const p of SECRET_PATTERNS) {
     out = out.replace(p.re, (m, ...groups) => {
@@ -205,12 +245,16 @@ function redact(line) {
     });
   }
   out = out.replace(JWT_RE, (m) => mask(m));
-  out = out.replace(DB_URL_RE, (m, scheme, user, password) => (masked(password) ? m : m.replace(`:${password}@`, `:${mask(password)}@`)));
-  out = out.replace(GENERIC_ASSIGN_RE, (m, name, quote, value) => (masked(value) ? m : m.replace(value, mask(value))));
+  out = out.replace(DB_URL_RE, (m, scheme, user, password) => (keep(password) ? m : m.replace(`:${password}@`, `:${mask(password)}@`)));
+  out = maskSigningLiterals(out);
+  out = out.replace(REDACT_ASSIGN_RE, (m, name, quote, value) => (keep(value) || value.includes('${') ? m : m.replace(`${quote}${value}${quote}`, `${quote}${mask(value)}${quote}`)));
   // Quoted high-entropy blobs that don't match a known shape.
   out = out.replace(/(["'`])([A-Za-z0-9+/=_-]{24,})\1/g, (m, q, v) => (entropy(v) > 3.5 ? `${q}${mask(v)}${q}` : m));
-  // KEY=value lines (env files, shell) with secret-ish names.
-  out = out.replace(/\b([A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|TOKEN|PRIVATE|_KEY|APIKEY)[A-Z0-9_]*)\s*=\s*(["']?)([^\s"'#]{4,})\2/g, (m, name, q, v) => (masked(v) ? m : m.replace(v, mask(v))));
+  // KEY=value / KEY: value (env files, YAML, shell) with secret-ish names; skip values that are code.
+  out = out.replace(/\b([A-Za-z0-9_]*(?:SECRET|PASSWORD|PASSWD|TOKEN|PRIVATE|_KEY|APIKEY|API_KEY)[A-Za-z0-9_]*)(\s*[:=]\s*)(["']?)([^\s"'#,;]{3,})\3/gi, (m, name, sep, q, v) => {
+    if (keep(v) || /[()[\]{}]|^(?:process|import|env)\.|^\$/.test(v)) return m;
+    return `${name}${sep}${q}${mask(v)}${q}`;
+  });
   return out;
 }
 
@@ -229,8 +273,11 @@ const PUBLIC_PREFIXES = [
   { prefix: 'PUBLIC_', framework: 'SvelteKit/Astro', needs: ['@sveltejs/kit', 'astro'] },
 ];
 
-/** Names (after the public prefix) that mean "secret". */
-const SECRET_ENV_NAME_RE = /(SECRET|PRIVATE|PASSWORD|PASSWD|PWD\b|DATABASE_URL|DB_URL|DB_PASS|CONNECTION_STRING|ADMIN_KEY|MASTER_KEY|SIGNING|ENCRYPTION_KEY|AUTH_TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|BOT_TOKEN|API_TOKEN|SENDGRID|RESEND_API|MAILGUN|POSTMARK|TWILIO_AUTH|AWS_ACCESS|PLAID_SECRET|ALGOLIA_ADMIN|ALGOLIA_WRITE|UPSTASH_REDIS_REST_TOKEN|MONGODB_URI|MONGO_URI|REDIS_URL|SENTRY_AUTH|VERCEL_TOKEN|NETLIFY_AUTH|CLOUDFLARE_API|GITHUB_TOKEN|SLACK_TOKEN|DISCORD_TOKEN|PINECONE|SERVICE_ACCOUNT|FIREBASE_ADMIN|STRIPE_SK|SK_LIVE)/;
+/** Names (after the public prefix) that mean "secret" on their own. */
+const SECRET_ENV_NAME_RE = /(SECRET|PRIVATE|PASSWORD|PASSWD|PWD\b|DATABASE_URL|DB_URL|DB_PASS|CONNECTION_STRING|ADMIN_KEY|MASTER_KEY|SIGNING_KEY|SIGNING_SECRET|ENCRYPTION_KEY|AUTH_TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|BOT_TOKEN|API_TOKEN|MONGODB_URI|MONGO_URI|REDIS_URL|SERVICE_ACCOUNT|STRIPE_SK|SK_LIVE)/;
+
+/** Provider names that only mean "secret" together with KEY/TOKEN/SECRET (SENDGRID_SENDER_NAME is fine). */
+const PROVIDER_ENV_NAME_RE = /(SENDGRID|RESEND|MAILGUN|POSTMARK|TWILIO|AWS|PLAID|ALGOLIA_ADMIN|ALGOLIA_WRITE|UPSTASH|SENTRY|VERCEL|NETLIFY|CLOUDFLARE|GITHUB|SLACK|DISCORD|PINECONE|FIREBASE_ADMIN|STRIPE|CLERK|AUTH0)/;
 
 /** Supabase service-role style names (reported by DATA-02, not SEC-08). */
 const SERVICE_ROLE_NAME_RE = /(SERVICE_?ROLE|SERVICE_?KEY|SUPABASE_SECRET|SB_SECRET)/;
@@ -241,7 +288,7 @@ const AI_ENV_NAME_RE = /(OPENAI|ANTHROPIC|CLAUDE|GROQ|MISTRAL|COHERE|REPLICATE|H
 const KEYISH_NAME_RE = /(KEY|TOKEN|SECRET)/;
 
 /** Public names by design (anon/publishable keys, ids, URLs). */
-const PUBLIC_ENV_OK_RE = /(ANON|PUBLISHABLE|PUBLIC_KEY|CLIENT_ID|APP_ID|PROJECT_ID|MEASUREMENT_ID|SITE_KEY|DSN|_URL$|HOST|DOMAIN|REGION|BUCKET|SENDER_ID|AUTH_DOMAIN)/;
+const PUBLIC_ENV_OK_RE = /(ANON|PUBLISHABLE|PUBLIC_KEY|CLIENT_ID|APP_ID|PROJECT_ID|MEASUREMENT_ID|SITE_?KEY|DSN|_URL$|HOST|DOMAIN|REGION|BUCKET|SENDER_ID|AUTH_DOMAIN)/;
 
 /** Names that stay secret even when they also match PUBLIC_ENV_OK_RE (e.g. DATABASE_URL). */
 const ALWAYS_SECRET_NAME_RE = /(SECRET|PRIVATE|PASSWORD|PASSWD|DATABASE_URL|DB_URL|CONNECTION_STRING|MONGODB_URI|MONGO_URI|REDIS_URL)/;
@@ -268,17 +315,23 @@ function classifyPublicEnv(name, value) {
     if (hit && !hit.google) return hit.ai ? 'ai' : 'secret';
     if (findDbUrls(value).some((d) => !d.placeholder)) return 'secret';
   }
+  if (value && PUBLIC_VALUE_RE.test(value)) return null;
   if (PUBLIC_ENV_OK_RE.test(upper) && !ALWAYS_SECRET_NAME_RE.test(upper)) return null;
   if (SECRET_ENV_NAME_RE.test(upper)) return 'secret';
+  // Stripe/Clerk publishable keys are also called *_KEY, so for them only TOKEN/SECRET/PASSWORD/AUTH count.
+  if (PROVIDER_ENV_NAME_RE.test(upper) && (/(TOKEN|SECRET|PASSWORD|AUTH)/.test(upper) || (/KEY/.test(upper) && !/(STRIPE|CLERK)/.test(upper)))) return 'secret';
   return null;
 }
 
 module.exports = {
+  DEFAULT_PASSWORDS,
+  SECRET_HINT_RE,
   SECRET_PATTERNS,
   JWT_RE,
   DB_URL_RE,
   LOCAL_HOST_RE,
   GENERIC_ASSIGN_RE,
+  REDACT_ASSIGN_RE,
   PUBLIC_NAME_RE,
   PUBLIC_VALUE_RE,
   PUBLIC_PREFIXES,

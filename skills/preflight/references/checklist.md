@@ -36,7 +36,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Database connection strings or DB passwords written into source or config files.
 - **Why it matters:** Whoever reads the repo can connect straight to your database, skipping your app, your auth and RLS. GitHub found 39M leaked secrets in 2024, and bots harvest them within minutes.
-- **How it's detected:** Script: connection URLs with an inline password (postgres://, mysql://, mongodb(+srv)://, redis://, amqp://, mssql://…) pointing at a non-local host, DB password variables (DB_PASSWORD, POSTGRES_PASSWORD…) with literal values, and `password:` keys inside DB client constructors. Placeholders, ${VAR} templates and .env files (SEC-02) are excluded. Localhost URLs downgrade to warn.
+- **How it's detected:** Script: connection URLs with an inline password (postgres://, mysql://, mongodb(+srv)://, redis://, amqp://, mssql://…) pointing at a non-local host, DB password variables (DB_PASSWORD, POSTGRES_PASSWORD…) with literal values, and `password:` keys inside DB client constructors. Placeholders, ${VAR} templates and .env files (SEC-02) are excluded. Localhost URLs downgrade to warn, as do passwords for containers that compose files, CI jobs or tests start themselves.
 - **Fix:** Rotate the database password now (Supabase: Project Settings → Database → Reset database password). Then read the connection string from an environment variable (process.env.DATABASE_URL) that you set in your host's encrypted env settings, and delete the literal from source. The old password stays public in git history (SEC-04), so rotating is the real fix.
 - **Agent question (warn/manual):** Is this a real credential for a database reachable from the internet, or a local/dev placeholder?
 
@@ -46,7 +46,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** .env files that are tracked by git, sit inside a public web root, or aren't covered by .gitignore.
 - **Why it matters:** A committed .env hands every secret to anyone with repo access. A .env under public/ is served at https://yoursite/.env, a path scanners request constantly.
-- **How it's detected:** Script: lists every .env* file (plus .dev.vars and .envrc) and checks three things: tracked (`git ls-files`), ignored (`git check-ignore`), and whether it sits under public/, static/, dist/, build/, out/ or another web root. Example files (.env.example, .env.sample, .env.template) are flagged only when they hold real-looking secrets. A committed .env with no secret-looking values is a warn.
+- **How it's detected:** Script: lists every .env* file (plus .dev.vars and .envrc) and checks three things: tracked (`git ls-files`), ignored (`git check-ignore`), and whether it sits under public/, static/, dist/, build/, out/ or another web root. Example files (.env.example, .env.sample, .env.template) fail only when they hold a provider-format secret or a real DB URL, and warn when a secret-named value looks randomly generated. A committed .env with no secret-looking values is a warn.
 - **Fix:** Run `git rm --cached .env` (your local copy stays), add `.env*` and `!.env.example` to .gitignore, and commit. Then rotate every secret the file held, because it's already in history. Never keep env files under public/ or any folder your host serves. Set production secrets in the hosting dashboard instead.
 - **Agent question (warn/manual):** Does this env file hold real secrets, and has every one of them been rotated?
 
@@ -56,7 +56,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** API keys, tokens and private keys pasted directly into source or config files.
 - **Why it matters:** Anything in the repo becomes public once it's shared, deployed or open-sourced. Leaked Stripe, AWS and OpenAI keys get used for fraud and free compute within minutes.
-- **How it's detected:** Script: provider key formats (AWS AKIA…, Stripe sk_live_/rk_live_, GitHub ghp_/github_pat_, OpenAI sk-/sk-proj-, Anthropic sk-ant-, Slack, SendGrid, Twilio SK…, npm, Supabase sb_secret_ and service_role JWTs, PEM private keys…), plus generic `api_key/secret/token/password = "<literal>"` assignments with secret-like values. Covers the working tree except build output and .env files. If the only hits are Stripe test keys, the result is a warn.
+- **How it's detected:** Script: provider key formats (AWS AKIA…, Stripe sk_live_/rk_live_, GitHub ghp_/github_pat_, OpenAI sk-/sk-proj-, Anthropic sk-ant-, Slack, SendGrid, Twilio SK…, npm, Supabase sb_secret_ and service_role JWTs, PEM private keys…), plus generic `api_key/secret/token/password = "<literal>"` assignments with secret-like values. Covers the working tree except build output and .env files. Generic assignments are skipped in tests, seed scripts, docs and API specs (sample credentials), and documented `example:` values are ignored; provider formats still count there, as a warn when they sit in tests. If the only hits are test-mode or local-dev keys, keys in tests, or literal values in CI/compose files, the result is a warn.
 - **Fix:** Revoke and reissue each key in the provider's dashboard first. Deleting it from code doesn't un-leak it. Then load it from an environment variable in server-only code. Add a pre-commit secret scanner (gitleaks) or turn on GitHub push protection so it can't happen again.
 - **Agent question (warn/manual):** Is this value a live credential? If it is only a test or sample value, say so explicitly.
 
@@ -66,7 +66,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Secrets committed at any point in the last 200 commits (by default), even if they were deleted later.
 - **Why it matters:** Deleting a key in a later commit doesn't remove it. Anyone who clones the repo can run `git log -p` and read it, and public repos are scraped around the clock.
-- **How it's detected:** Script: streams `git log -p` for the last 200 commits, limited to the scanned directory, and runs the high-confidence secret patterns over added lines. It also lists .env files that were ever committed. Each hit says whether the secret is still in the working tree.
+- **How it's detected:** Script: streams `git log -p` for the last 200 commits, limited to the scanned directory, and runs the high-confidence secret patterns over added lines. It also lists .env files that were ever committed with secret-looking values. Each hit says whether the secret is still in the working tree; hits that are only test-mode keys or sit in test files warn. Shallow clones are called out, since their older history can't be scanned.
 - **Fix:** Rotate every listed secret. That is the real fix. You can also purge history with `git filter-repo --invert-paths --path .env` (or BFG), force-push, and have collaborators re-clone. GitHub caches and forks may still hold the old commits, so never skip rotation.
 - **Agent question (warn/manual):** Has each of these secrets been rotated since it was committed?
 
@@ -128,7 +128,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** API routes that change state or return user data with no visible authentication or authorization check.
 - **Why it matters:** An API route without an auth check is public. Anyone can call it with curl, no UI needed.
-- **How it's detected:** Script: enumerates Express/Fastify/Hono/Koa routes, Next.js route handlers and pages/api, server actions, SvelteKit/Remix actions, and Netlify/Vercel/Supabase/Firebase functions. It flags POST/PUT/PATCH/DELETE handlers (and GETs on sensitive paths) with no auth primitive in the handler, its middleware chain, the router mount or middleware.ts. Login, signup, webhook and health routes are excluded. The agent confirms each one.
+- **How it's detected:** Script: enumerates Express/Fastify/Hono/Koa routes, Next.js route handlers and pages/api, server actions, SvelteKit/Remix actions, and Netlify/Vercel/Supabase/Firebase functions. It flags POST/PUT/PATCH/DELETE handlers (and GETs on sensitive paths) with no auth primitive in the handler, a helper or wrapper it calls (one hop, through imports and @/ or workspace aliases), its middleware chain, the router mount, or middleware.ts/proxy.ts. Login, signup, webhook and health routes (and server actions named for them) are excluded. The agent confirms each one.
 - **Fix:** Put auth in one place: a middleware applied to the whole /api router (or Next.js middleware plus a server-side session check in each handler). Deny by default and explicitly allowlist the few public routes. Inside handlers, take the user from the verified session, never from a userId in the request body.
 - **Agent question (warn/manual):** Should each of these routes require a signed-in user? If they are protected, which middleware or check does it (the scanner could not see one)?
 
@@ -138,7 +138,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Server-side queries that return whole collections without filtering by the signed-in user.
 - **Why it matters:** A "list my orders" endpoint that runs `select * from orders` returns everyone's orders. Most vibe-coded data leaks start this way.
-- **How it's detected:** Script: in server code, Supabase `.from(x).select()` chains without an owner filter, Prisma `findMany()` without a user-scoped `where`, Mongo `find({})`, and `SELECT … FROM` with no user predicate, on tables that look user-owned.
+- **How it's detected:** Script: in route handlers (not shared helpers they call), Supabase `.from(x).select()` chains without an owner filter, Prisma `findMany()` without a user-scoped `where`, Mongo `find({})`, and `SELECT … FROM` with no user predicate, on tables that look user-owned. Cron/job and admin routes are skipped: listing everything is their job, and AUTH-04 covers who can reach admin routes.
 - **Fix:** Scope every query to the authenticated user (`.eq('user_id', user.id)`, `where: { userId: session.user.id }`) and back it with RLS (`using (auth.uid() = user_id)`) so a forgotten filter fails closed. Don't use the service-role key for user-facing reads.
 - **Agent question (warn/manual):** Can this query return rows that belong to other users? If RLS does not apply here (service role or a direct DB connection), what filters it?
 
@@ -148,7 +148,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Admin, internal or staff server routes with no authentication or role check, or admin pages gated only in the browser.
 - **Why it matters:** Admin endpoints delete users, issue refunds and export data. Hiding the button doesn't protect the endpoint.
-- **How it's detected:** Script: server routes whose path or router file mentions admin/internal/staff/backoffice. Fail when no auth primitive exists anywhere in the chain (handler, router mount, middleware.ts). Warn when there is auth but no role check, and for admin pages that only redirect client-side.
+- **How it's detected:** Script: server routes whose path or router file mentions admin/internal/staff/backoffice. Fail when no auth primitive exists anywhere in the chain (handler, router mount, middleware.ts). Warn when there is auth but no role check, and for admin pages (route files under an admin segment, not components or emails) with no server-side guard in the page, its layouts or server load files, or a helper they call, which includes pages that only redirect client-side.
 - **Fix:** Enforce role checks on the server for every admin route: a `requireAdmin` middleware that reads the role from the verified session or app_metadata, never from the request. Keep admin APIs under one router with that middleware mounted first, and log admin actions.
 - **Agent question (warn/manual):** Who can call this admin route today? Show the server-side check that limits it to admins, or confirm it is missing.
 
@@ -168,7 +168,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Tokens that never expire, JWTs decoded without verification, "none" algorithms, or auth tokens kept in localStorage.
 - **Why it matters:** A stolen token that never expires is permanent account access, and jwt.decode() accepts any forged token.
-- **How it's detected:** Script: jwt.decode without jwt.verify, algorithm "none" or ignoreExpiration: true (fail); jwt.sign without expiresIn or with lifetimes over 30 days, tokens written to localStorage, and express-session on the default MemoryStore (warn).
+- **How it's detected:** Script: jwt.decode without jwt.verify, algorithm "none" or ignoreExpiration: true (fail); jwt.sign without expiresIn (payloads and options defined elsewhere in the file are followed) or with lifetimes over 30 days, tokens written to localStorage, and express-session on the default MemoryStore (warn).
 - **Fix:** Verify every token with an explicit algorithms allowlist. Issue short-lived access tokens (an hour or less) with rotating refresh tokens. Keep session tokens in httpOnly cookies rather than localStorage, use a persistent session store, and invalidate sessions on logout and password change.
 - **Agent question (warn/manual):** How long does a stolen token or session stay valid, and is every token signature-verified?
 
@@ -208,7 +208,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Session or auth cookies set without HttpOnly, Secure and SameSite.
 - **Why it matters:** Without HttpOnly, any XSS can read the session cookie. Without Secure, it leaks over HTTP. Without SameSite, it rides along on cross-site requests (CSRF).
-- **How it's detected:** Script: res.cookie, cookies().set, setCookie and cookie.serialize calls, plus express-session/cookie-session options, that are missing httpOnly, secure or sameSite (or set them to false); document.cookie writes of tokens; and, with --url, the Set-Cookie headers from the live site.
+- **How it's detected:** Script: res.cookie, cookies().set, setCookie and cookie.serialize calls, plus express-session/cookie-session options, that are missing httpOnly, secure or sameSite (or set them to false; shorthand and computed values get the benefit of the doubt); document.cookie writes of tokens; and, with --url, the Set-Cookie headers from the live site.
 - **Fix:** Set auth cookies with `{ httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: … }` (use 'strict' for admin apps). Never set auth tokens from browser JavaScript.
 - **Agent question (warn/manual):** Does this cookie carry a session or auth token? If so, why is it missing HttpOnly/Secure/SameSite?
 
@@ -240,7 +240,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Rules or policies that grant everyone access: Firestore/Storage `allow read, write: if true`, test-mode date rules, RTDB `".read": true`, Supabase `using (true)` on writes, grants to anon, public buckets.
 - **Why it matters:** Open rules are the same as no auth. In 2025 the Tea app leaked about 72,000 images, including 13,000 ID photos, from an unsecured Firebase storage bucket.
-- **How it's detected:** Script: parses firestore.rules, storage.rules, database.rules.json, SQL policies, docker-compose files and Terraform. Always-true rules, test-mode expiry rules, write policies with `using (true)`, Postgres trust auth and publicly accessible DB instances fail. `using (true)` SELECT policies, public storage buckets, security-definer views and functions, and publicly bound DB ports warn.
+- **How it's detected:** Script: parses firestore.rules, storage.rules, database.rules.json, SQL policies, docker-compose files and Terraform. Always-true rules, test-mode expiry rules, write policies with `using (true)`, Postgres trust auth on a port published to all interfaces, and publicly accessible DB instances fail. `using (true)` SELECT policies, public storage buckets and publicly bound DB ports warn, as do (in Supabase projects, where the API exposes the schema) views without security_invoker and SECURITY DEFINER functions without a fixed search_path.
 - **Fix:** Write rules that check identity and ownership (`allow read, write: if request.auth != null && request.auth.uid == resource.data.userId;`, `using (auth.uid() = user_id)`). Keep buckets private and serve files through signed URLs. Test your rules with the Firebase emulator or Supabase's policy tools before launch.
 - **Agent question (warn/manual):** Is this access intentionally public (e.g. published blog posts)? If not, what ownership condition should the rule enforce?
 
@@ -344,7 +344,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Dynamic HTML inserted without sanitization: dangerouslySetInnerHTML, innerHTML/outerHTML, insertAdjacentHTML, document.write, v-html, {@html}, unescaped template tags.
 - **Why it matters:** Stored XSS runs attacker JavaScript in every viewer's browser. It can steal sessions and API keys from localStorage, or make requests as the victim.
-- **How it's detected:** Script: the sinks above with a non-literal value and no DOMPurify/sanitize-html/xss call on the same expression; reflected `res.send` templates that include request data; EJS `<%-`, Handlebars `{{{ }}}` and Pug `!=`. Every hit is a warn the agent verifies.
+- **How it's detected:** Script: the sinks above with a non-literal value and no DOMPurify/sanitize-html/xss call or sanitize*/escape* helper on the same expression (values named as already sanitized, like safeHtml, and templates that only interpolate constants are skipped); reflected `res.send` templates that include request data; EJS `<%-`, Handlebars `{{{ }}}` and Pug `!=`. Every hit is a warn the agent verifies.
 - **Fix:** Render text, not HTML (React escapes `{value}` by default). When you must render HTML, sanitize it with DOMPurify (`DOMPurify.sanitize(html)`) right at the sink, use textContent instead of innerHTML, and add a Content-Security-Policy (APP-15) as a second line of defense.
 - **Agent question (warn/manual):** Can any part of this HTML come from a user (directly or via the database)? If so, where is it sanitized?
 
@@ -384,7 +384,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Server-side fetches to URLs that come from the request.
 - **Why it matters:** SSRF makes your server call internal services and cloud metadata endpoints (169.254.169.254) to steal credentials, or attack other sites on an attacker's behalf.
-- **How it's detected:** Script: server-side fetch/axios/got/http.get/request calls whose URL is request data (or a variable assigned from it) and whose host isn't pinned by a literal prefix.
+- **How it's detected:** Script: server-side fetch/axios/got/http.get/request calls whose URL is request data (or a variable assigned from it), whose host isn't pinned by a literal or constant prefix, and that no allowlist or URL validator runs before.
 - **Fix:** Allowlist the hosts you intend to call and compare `new URL(input).hostname` against the list. Block private and link-local IP ranges after DNS resolution, disable redirects (or re-validate every hop), and set short timeouts.
 - **Agent question (warn/manual):** Can a user choose the host this request goes to?
 
@@ -454,7 +454,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Webhook endpoints (Stripe, Twilio, Clerk/Svix, GitHub, Shopify, Paddle, Lemon Squeezy…) that don't verify the provider's signature.
 - **Why it matters:** Without a signature check, anyone can POST a fake "payment succeeded" event and unlock paid features or orders for free.
-- **How it's detected:** Script: route or handler files that look like webhook receivers (the path or file mentions "webhook", or provider signature headers are read) with no verification primitive (stripe.webhooks.constructEvent, twilio.validateRequest, svix/standardwebhooks verify, HMAC with timingSafeEqual…) in the same file.
+- **How it's detected:** Script: POST routes that look like webhook receivers (the path, route file or handler file mentions "webhook") and read the request, with no verification primitive (stripe.webhooks.constructEvent, twilio.validateRequest, svix/standardwebhooks verify, an HMAC compared by hand, a shared-secret header check…) in the route, its handler or the module it re-exports (fail). A handler that only passes the request to another function warns. Signed-in endpoints (managing webhook settings), tRPC routes and server actions are not receivers.
 - **Fix:** Verify every webhook with the provider SDK before trusting it, e.g. `stripe.webhooks.constructEvent(rawBody, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET)` on the raw body. Reject on failure, and make handlers idempotent on the event id.
 - **Agent question (warn/manual):** Is the signature verified somewhere this scanner could not see (e.g. a shared middleware)?
 
@@ -504,7 +504,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Error handlers that send stack traces or whole error objects to clients, or Express apps not running with NODE_ENV=production.
 - **Why it matters:** Stack traces reveal file paths, library versions, SQL and sometimes secrets: a map for the next attack.
-- **How it's detected:** Script: responses that include err.stack or a raw error object, and self-hosted Express apps (Dockerfile, Procfile, fly.toml, render.yaml) where NODE_ENV=production is never set, so Express prints stack traces.
+- **How it's detected:** Script: responses that include err.stack or a raw error object (development-only branches and logger calls excluded), and self-hosted Express apps (Dockerfile, Procfile, fly.toml, render.yaml) where NODE_ENV=production is never set, so Express prints stack traces.
 - **Fix:** Log the full error server-side (Sentry or your logs) and return a generic message with a request id (`res.status(500).json({ error: 'Internal error', id })`). Set NODE_ENV=production on every self-hosted deployment.
 - **Agent question (warn/manual):** What exactly does a client receive when this handler throws in production?
 
@@ -514,7 +514,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Log files committed or served publicly, and logging of passwords, tokens or whole request bodies.
 - **Why it matters:** Logs are where secrets go to be forgotten. Committed or public logs leak tokens and PII, and log pipelines are a common breach source.
-- **How it's detected:** Script: *.log files and logs/ folders that git tracks or that sit in a public web root (fail), static serving of log folders, and console/logger calls that print password, token, secret or authorization values, or the whole req.body/req.headers, in auth or payment code (warn).
+- **How it's detected:** Script: *.log files and logs/ folders that git tracks or that sit in a public web root (fail), static serving of log folders, and console/logger calls that print password, token, secret or authorization values, or the whole req.body/req.headers, in auth or payment code (warn). Presence checks such as `!!token` or `secret.length` don't count.
 - **Fix:** Add `*.log` and `logs/` to .gitignore and `git rm --cached` them, and never serve log folders. Redact secrets when logging (pino's redact option), or log explicit safe fields instead of whole bodies.
 - **Agent question (warn/manual):** Do these logs contain tokens, passwords or personal data, and who can read them?
 
@@ -546,7 +546,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** A static count of basic accessibility signals: ARIA labels and roles, h1 headings, image alt text, accessible names on buttons and links, keyboard support for clickable elements, html lang, and zoom.
 - **Why it matters:** More than 4,000 ADA digital-accessibility lawsuits were filed in the US in 2024 (UsableNet), mostly against small businesses. Missing alt text and unlabeled buttons are the usual exhibits.
-- **How it's detected:** Script: counts aria-label/aria-labelledby, role=, <h1>, <img>/<Image> without alt, icon-only buttons and links without names, onClick on div/span without role, tabIndex and a key handler, inputs without labels, <html> without lang, and disabled zoom. Near-zero ARIA, or any of those issues, = warn.
+- **How it's detected:** Script: counts aria-label/aria-labelledby, role=, <h1>, <img>/<Image> without alt, icon-only buttons and links without names, onClick on div/span without role, tabIndex and a key handler, inputs without labels, <html> without lang, and disabled zoom. Vendored or generated HTML (public/ subfolders, docs, coverage) is skipped, and at most five issues per file are listed. Near-zero ARIA, or any of those issues, = warn.
 - **Fix:** Give every image an alt (alt="" for decorative ones) and every icon button an aria-label. Use real <button>/<a> elements instead of clickable divs, label every input, add one h1 per page and lang on <html>. Then run axe DevTools or Lighthouse and do a keyboard-only pass before launch.
 - **Agent question (warn/manual):** Do these components render user-facing UI in production, and can each flagged control be reached and understood with a keyboard and screen reader?
 
@@ -578,7 +578,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Packages with dependencies but no committed lockfile, a gitignored lockfile, or "*"/"latest" version ranges.
 - **Why it matters:** Without a lockfile every install can pull different, possibly compromised, versions. That's how malicious releases like the 2025 chalk/debug compromise reach production.
-- **How it's detected:** Script: for each package.json with dependencies, looks for package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml or bun.lock(b) in its folder or the workspace root, checks that it isn't gitignored, and flags "*", "latest" and "x" ranges.
+- **How it's detected:** Script: for each package.json with dependencies, looks for package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml or bun.lock(b) in its folder or the workspace root, checks that it isn't gitignored, and flags "*", "latest" and "x" ranges (peerDependencies and workspace packages excepted).
 - **Fix:** Commit the lockfile your package manager generates, install with `npm ci` (or `pnpm install --frozen-lockfile`) in CI and deploys, and pin wildcard ranges.
 - **Agent question (warn/manual):** How are production installs pinned without a lockfile?
 
@@ -588,7 +588,7 @@ Modes: **auto** means the script decides. **auto + agent** means the script flag
 
 - **What:** Dependencies that are known-malicious, known-compromised versions, typosquats of popular packages, unexpected install scripts, or non-registry sources.
 - **Why it matters:** Supply-chain attacks are recent and real. In September 2025 the chalk/debug compromise hit packages with about 2 billion weekly downloads, and the Shai-Hulud worm spread to 500+ npm packages, stealing tokens on install.
-- **How it's detected:** Script: offline checks against a built-in list of known-malicious names and compromised versions (versions read from the lockfile), edit-distance-1 lookalikes of popular packages, install/postinstall scripts of installed direct dependencies (when node_modules exists), and git/http/tarball dependency sources. Package-age checks are skipped because they need a network call per package.
+- **How it's detected:** Script: offline checks against a built-in list of known-malicious names and compromised versions (versions read from the lockfile), edit-distance-1 lookalikes of popular packages (separator-only differences such as querystring/query-string excepted), install/postinstall scripts of installed direct dependencies (when node_modules exists), and git/http/tarball dependency sources. Package-age checks are skipped because they need a network call per package.
 - **Fix:** Remove anything flagged as malicious and rotate the secrets on every machine that installed it. Check lookalike names against the real package's npm page. Install with `--ignore-scripts` (or use pnpm, which blocks dependency install scripts by default) and allowlist the few packages that need build scripts.
 - **Agent question (warn/manual):** Is each flagged package the one you meant to install, and does it need its install script?
 

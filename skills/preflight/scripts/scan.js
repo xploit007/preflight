@@ -30,12 +30,13 @@ const { SEVERITIES, STATUSES, result } = require('./lib/result');
 const { loadRepo } = require('./lib/repo');
 const { render, useColor } = require('./lib/format');
 
-// Network/subprocess-bound groups first, so their I/O overlaps with the CPU-bound ones.
+// secrets runs first: it records every secret it finds so later groups' snippets mask them.
+// Network/subprocess-bound groups come next, so their I/O overlaps with the CPU-bound ones.
 const GROUPS = [
+  require('./checks/secrets'),
   require('./checks/deps'),
   require('./checks/headers'),
   require('./checks/supabase'),
-  require('./checks/secrets'),
   require('./checks/env'),
   require('./checks/data'),
   require('./checks/auth'),
@@ -253,11 +254,17 @@ async function scan(opts) {
 
   const byId = new Map();
   const timings = {};
+  // Groups run concurrently: syncMs is the CPU time a group spent before its first await
+  // (most of the work), doneAtMs is when it finished, counted from the start of the scan.
   await Promise.all(
     groups.map(async (g) => {
       const t0 = Date.now();
+      const timing = { syncMs: 0, doneAtMs: 0 };
+      timings[g.name] = timing;
       try {
-        const out = await g.run(target, opts);
+        const pending = g.run(target, opts);
+        timing.syncMs = Date.now() - t0;
+        const out = await pending;
         for (const r of out) {
           checkShape(r);
           if (!byId.has(r.id)) byId.set(r.id, r);
@@ -269,7 +276,8 @@ async function scan(opts) {
           }
         }
       }
-      timings[g.name] = Date.now() - t0;
+      if (!timing.syncMs) timing.syncMs = Date.now() - t0;
+      timing.doneAtMs = Date.now() - started;
     }),
   );
 
@@ -400,17 +408,45 @@ function inner(text, end, name) {
   return close === -1 ? '' : text.slice(end, close);
 }
 
+/** The {…} expression of a JSX attribute (onClick={…}), or ''. */
+function attrExpr(tag, name) {
+  const m = new RegExp(`\\b${name}\\s*=\\s*\\{`).exec(tag);
+  if (!m) return '';
+  let depth = 0;
+  for (let i = m.index + m[0].length - 1; i < tag.length; i++) {
+    if (tag[i] === '{') depth++;
+    else if (tag[i] === '}' && --depth === 0) return tag.slice(m.index + m[0].length, i);
+  }
+  return '';
+}
+
+/** onClick={(e) => e.stopPropagation()}: a wrapper that stops bubbling, not a control. */
+function onlyStopsEvents(tag) {
+  const expr = attrExpr(tag, 'onClick');
+  if (!/\b(?:stopPropagation|preventDefault)\s*\(/.test(expr)) return false;
+  return [...expr.matchAll(/([\w$.]+)\s*\(/g)].every((m) => /(?:^|\.)(?:stopPropagation|preventDefault)$/.test(m[1]));
+}
+
 const has = (tag, re) => re.test(tag);
+const PER_FILE = 5;
 const ARIA_NAME_RE = /\baria-label(?:ledby)?\s*=|\btitle\s*=|\{\s*\.\.\./;
 
 function smokeTest(repo) {
-  const files = repo.files.filter((f) => !f.build && UI_FILE_RE.test(f.name) && !repo.isTest(f) && !/(?:^|\/)(?:emails?|mail)\//.test(f.rel));
+  const component = (f) => /\.(?:jsx|tsx|vue|svelte|astro)$/.test(f.name);
+  const framework = repo.files.some((f) => !f.build && component(f));
+  // Vendored or generated HTML (public/pdfjs/viewer.html, coverage and docs output) is not the app's UI.
+  const vendored = (f) => /\.html?$/.test(f.name) && (/(?:^|\/)(?:coverage|docs?|storybook-static|playwright-report|test-results|_site|site)\//.test(f.rel) || (framework && /(?:^|\/)(?:public|static)\/[^/]+\//.test(f.rel)) || /(?:^|\/)(?:vendor|third[_-]?party|lib\/vendor)\//.test(f.rel));
+  const files = repo.files.filter((f) => !f.build && UI_FILE_RE.test(f.name) && !repo.isTest(f) && !/(?:^|\/)(?:emails?|mail)\//.test(f.rel) && !vendored(f));
   if (!files.length) return na('LEGAL-02', 'no UI files (JSX/TSX/Vue/Svelte/HTML templates) found');
   const counts = { ariaLabel: 0, role: 0, aria: 0, h1: 0, img: 0, imgNoAlt: 0, button: 0, buttonNoName: 0, link: 0, linkNoName: 0, clickable: 0, inputs: 0, inputNoLabel: 0 };
   const issues = [];
+  const perFile = new Map();
   const add = (f, index, note) => {
     const line = repo.lineOf(f, index);
-    if (!repo.suppressed(f, line)) issues.push(ev(f.rel, line, note, repo.snippet(f, line)));
+    if (repo.suppressed(f, line)) return;
+    const n = (perFile.get(f.rel) || 0) + 1;
+    perFile.set(f.rel, n);
+    if (n <= PER_FILE) issues.push(ev(f.rel, line, note, repo.snippet(f, line)));
   };
   let pages = 0;
   for (const f of files) {
@@ -444,7 +480,7 @@ function smokeTest(repo) {
       }
     }
     for (const t of tags(text, 'div|span|li|p|section|article|td|tr|i|svg|img')) {
-      if (!/\b(?:onClick|@click|on:click|v-on:click|\(click\))\s*=/.test(t.tag)) continue;
+      if (!/\b(?:onClick|@click|on:click|v-on:click|\(click\))\s*=/.test(t.tag) || onlyStopsEvents(t.tag)) continue;
       counts.clickable++;
       const role = /\brole\s*=/.test(t.tag);
       const focusable = /\btab[iI]ndex\s*=/.test(t.tag);
@@ -471,6 +507,7 @@ function smokeTest(repo) {
     for (const m of text.matchAll(/user-scalable\s*=\s*(?:no|0)|maximum-scale\s*=\s*1(?:\.0)?(?![\d.])/gi)) add(f, m.index, 'the viewport disables zoom (WCAG 1.4.4)');
     for (const m of text.matchAll(/\btab[iI]ndex\s*=\s*(?:["']|\{\s*)([1-9]\d*)/g)) add(f, m.index, `positive tabIndex (${m[1]}) breaks the natural focus order`);
   }
+  for (const [rel, n] of perFile) if (n > PER_FILE) issues.push(ev(rel, null, `${n - PER_FILE} more issue(s) in this file, not listed`));
   const interactive = counts.button + counts.link + counts.inputs + counts.clickable;
   const summary = `Counts across ${files.length} UI file(s): ${counts.ariaLabel} aria-label/labelledby, ${counts.role} role=, ${counts.aria} aria-* total, ${counts.h1} <h1>, ${counts.img} <img> (${counts.imgNoAlt} without alt), ${counts.button} buttons (${counts.buttonNoName} unnamed), ${counts.link} links (${counts.linkNoName} unnamed), ${counts.inputs} form fields (${counts.inputNoLabel} unlabeled), ${counts.clickable} clickable non-buttons.`;
   const extra = [];
@@ -768,6 +805,10 @@ function csrf({ repo, routes, server }) {
   return warn('APP-04', [...sessions, ...writes.slice(0, 8).map((r) => ev(r.file.rel, r.line, `${r.method} ${r.path} changes state with no CSRF token, Origin check or SameSite cookie`))]);
 }
 
+// formData.get('file' | 'upload' | 'avatarFile' …), but not 'profile'. Fields like 'image' or
+// 'avatar' are often URL strings, so those only count with instanceof File / arrayBuffer().
+const FILE_FIELD_RE = /\.get(?:All)?\(\s*['"`](?:\w*(?:File|Upload|Attachment)s?|\w*[_-](?:file|upload|attachment)s?|files?|uploads?|attachments?)['"`]\s*\)/;
+
 // ── APP-07 ─────────────────────────────────────────────────────────────────
 
 function uploads({ repo, server }) {
@@ -794,7 +835,7 @@ function uploads({ repo, server }) {
       found = true;
       if (!/\blimits\b/.test(m[1] || '')) c.add(f, m.index, 'express-fileupload without limits');
     }
-    if (/\.formData\(\)/.test(text) && /\.get\(\s*['"`]\w*file\w*['"`]\s*\)|instanceof\s+File|\.arrayBuffer\(\)/.test(text)) {
+    if (/\.formData\(\)/.test(text) && (FILE_FIELD_RE.test(text) || /instanceof\s+File\b|\.arrayBuffer\(\)/.test(text))) {
       found = true;
       const sizeCheck = /\.size\s*[<>]=?|maxSize|MAX_(?:FILE|UPLOAD)_SIZE|\bsize\s*>/.test(text);
       const typeCheck = /\.type\s*(?:===|!==|\.startsWith|\.includes)|ALLOWED_(?:TYPES|MIME)|allowedTypes|mimetype|file-type/.test(text);
@@ -891,6 +932,10 @@ function debugTools({ repo, routes, server }) {
   return pass('APP-16', ['No debuggers, dev servers, GraphQL playgrounds, unguarded API docs or debug routes found in production paths.']);
 }
 
+const DEV_GUARD_RE = /NODE_ENV|\benv\s*[!=]==?\s*['"`](?:development|dev|production|prod)['"`]|\bis(?:Dev|Development|Prod|Production|Debug)\b|\bdev(?:Mode)?\s*(?:&&|\?)|import\.meta\.env\.(?:DEV|PROD)|\bdebug\s*(?:&&|\?)/;
+const LOG_CALL_RE = /\b(?:console|logger|log|winston|pino|bunyan|Sentry|captureException|reportError|this\.logger)\b[\w.]*\s*\(/;
+const RESPONSE_CTX_RE = /\b(?:res|reply|ctx|response)\b[\w.]*\.(?:json|send|status|body)\b|\bNextResponse\.|\bnew\s+Response\(|\bResponse\.json\(|\bctx\.body\s*=|\.json\(|\breturn\s+(?:json|error)\(/;
+
 // ── APP-17 ─────────────────────────────────────────────────────────────────
 
 function verboseErrors({ repo, server }) {
@@ -904,12 +949,22 @@ function verboseErrors({ repo, server }) {
       lines.add(line);
       c.add(f, index, note);
     };
+    const devOnly = (index, extra = '') => DEV_GUARD_RE.test(`${text.slice(Math.max(0, index - 250), index)}${extra}`);
     for (const m of text.matchAll(/\b(?:res|reply|ctx)\b[^;\n]{0,40}?\.(?:json|send)\(([^;\n]*)\)/g)) {
-      if (/\b(?:err|error|e|ex|exception)\.stack\b/.test(m[1])) once(m.index, 'the error stack trace is sent to the client');
+      if (/\b(?:err|error|e|ex|exception)\.stack\b/.test(m[1])) {
+        if (!devOnly(m.index, m[1])) once(m.index, 'the error stack trace is sent to the client');
+      }
       else if (/^\s*(?:err|error|e|ex)\s*$/.test(m[1])) once(m.index, 'the raw error object is sent to the client');
     }
     for (const m of text.matchAll(/\b(?:NextResponse|Response)\.json\(\s*(?:err|error|e)\s*[,)]/g)) once(m.index, 'the raw error object is returned to the client');
-    for (const m of text.matchAll(/\bstack\s*:\s*(?:err|error|e)\.stack\b/g)) once(m.index, 'the error stack trace is included in a response');
+    for (const m of text.matchAll(/\bstack\s*:\s*(?:err|error|e)\.stack\b/g)) {
+      // only response bodies: logger.error({ stack }) is fine, and so is a development-only branch
+      const lineStart = text.lastIndexOf('\n', m.index) + 1;
+      const before = text.slice(Math.max(0, m.index - 300), m.index);
+      if (LOG_CALL_RE.test(text.slice(lineStart, m.index)) || LOG_CALL_RE.test(before.slice(before.lastIndexOf(';') + 1))) continue;
+      if (!RESPONSE_CTX_RE.test(text.slice(Math.max(0, m.index - 300), m.index + 300)) || devOnly(m.index, text.slice(m.index, m.index + 80))) continue;
+      once(m.index, 'the error stack trace is included in a response');
+    }
   }
   // Self-hosted Express without NODE_ENV=production prints stack traces in its default error page.
   if (repo.hasDep('express')) {
@@ -946,7 +1001,10 @@ function logs({ repo, server }) {
     for (const m of text.matchAll(/\bexpress\.static\(\s*['"`][^'"`]*\blogs?\b[^'"`]*['"`]|\bserveIndex\(/g)) c.add(f, m.index, 'a logs folder (or directory listing) is served over HTTP');
     const sensitiveFile = /(?:auth|login|session|pay|checkout|stripe|billing|webhook|password|token)/i.test(f.rel);
     for (const m of text.matchAll(/\b(?:console\.(?:log|info|debug|warn|error)|logger\.(?:info|debug|log|warn|error)|log\.(?:info|debug))\(([^;\n]*)\)/g)) {
-      const args = m[1].replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '""');
+      // presence checks (!!token, Boolean(key), secret.length, key ? '…' : '…') don't log the value
+      const args = m[1]
+        .replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '""')
+        .replace(/!!\s*[\w$.?]+|\bBoolean\(\s*[\w$.?]+\s*\)|\btypeof\s+[\w$.?]+|[\w$.]+\??\.length\b|[\w$.?]+\s*\?\s*""\s*:\s*""|[\w$.?]+\s*[!=]==?\s*(?:undefined|null)/g, '');
       if (/\b(?:password|passwd|secret|apiKey|api_key|authorization|accessToken|refreshToken|cardNumber|card_number|cvv|ssn)\b/.test(args)) c.add(f, m.index, 'a password/token/secret value is written to the logs');
       else if (sensitiveFile && /\breq\.(?:body|headers)\b/.test(args)) c.add(f, m.index, 'the whole request body/headers is logged in auth/payment code');
     }
@@ -1002,7 +1060,7 @@ module.exports = { name: 'appsec', ids: IDS, run };
  */
 
 const { loadRepo } = require('../lib/repo');
-const { getRoutes, segments, routeBody } = require('../lib/routes');
+const { getRoutes, segments, routeBody, fileHelpers } = require('../lib/routes');
 const { AUTH_RE, ROLE_RE } = require('../lib/primitives');
 const net = require('../lib/net');
 const { pass, fail, warn, manual, na, ev } = require('../lib/result');
@@ -1013,12 +1071,16 @@ const IDS = ['AUTH-01', 'AUTH-02', 'AUTH-03', 'AUTH-04', 'AUTH-05', 'AUTH-06', '
 
 // Routes that are public by design (auth flows, webhooks with signatures, health checks, public forms).
 const PUBLIC_PATH_RE = /(?:^|\/)(?:login|log-in|logout|signin|sign-in|signup|sign-up|register|join|auth|oauth|callback|forgot[\w-]*|reset[\w-]*|verify[\w-]*|confirm[\w-]*|magic[\w-]*|otp|webhooks?|[\w-]*webhook[\w-]*|health|healthz|status|ping|ready|version|robots\.txt|sitemap[\w.]*|og|contact|subscribe|newsletter|waitlist|unsubscribe|csp-report|cron)(?:\/|$|\.)/i;
+// Server actions and functions are named, not pathed: action:login, fn:subscribeNewsletter.
+const PUBLIC_NAME_RE = /log_?in|log_?out|sign_?in|sign_?up|sign_?out|register|forgot|reset|verify|confirm|magic|otp|webhook|newsletter|waitlist|contact|oauth|callback|health|ping/i;
+const isPublicPath = (p) => PUBLIC_PATH_RE.test(p) || (/^(?:action|fn):/.test(p) && PUBLIC_NAME_RE.test(p.slice(p.indexOf(':') + 1)));
 const SENSITIVE_GET_RE = /(?:^|\/)(?:users?|me|account|accounts|admin|orders?|payments?|invoices?|billing|profiles?|messages?|settings|customers?|notes|documents|files|exports?|reports?|subscriptions?|transactions?|conversations?|chats?)(?:\/|$)/i;
+const BATCH_PATH_RE = /(?:^|\/)(?:cron|crons|jobs?|tasks?|workers?|queues?|scheduled)(?:\/|$)/i;
 const ADMIN_PATH_RE = /(?:^|\/)(?:admin|internal|staff|superuser|super-admin|backoffice|back-office|moderation|moderator|ops)(?:\/|$)/i;
 const MANAGED_AUTH_RE = /\bsupabase\.auth\.|\.auth\.(?:getUser|getSession|signInWith\w+|signUp)\b|@clerk\/|next-auth|@auth\/|firebase\/auth|firebase-admin\/auth|getAuth\(|@auth0\/|better-auth|\blucia\b|@kinde-oss\/|@workos-inc\/|@stackframe\/|@descope\/|supertokens|aws-amplify|@stytch\//;
 const USER_OWNED_TABLES = new Set(['users', 'profiles', 'accounts', 'orders', 'payments', 'invoices', 'messages', 'notes', 'todos', 'documents', 'files', 'subscriptions', 'carts', 'addresses', 'transactions', 'conversations', 'chats', 'bookings', 'appointments', 'tickets', 'uploads']);
 // Strict ownership predicates (stronger than "references the user somewhere").
-const OWNERSHIP_RE = /\.eq\(\s*['"`](?:user_?id|owner_?id|author_?id|created_?by|profile_?id|customer_?id|member_?id)['"`]|\b(?:userId|ownerId|authorId|user_id|owner_id|author_id|createdBy|created_by|customerId)\s*:\s*(?:req\.user|session|user|ctx|locals|auth|currentUser|claims)|\bAND\s+"?(?:user_id|owner_id|author_id|created_by)"?\s*=|\b(?:WHERE)\s+"?(?:user_id|owner_id|author_id|created_by)"?\s*=|\.(?:user_?id|owner_?id|author_?id|userId|ownerId)\s*[!=]==?\s*(?:req\.user|session\.user|user|currentUser)\??\.id|auth\.uid\(\)|\buserClient\(|\bcreateServerClient\(|\bcreateRouteHandlerClient\(|\bcreateServerComponentClient\(/;
+const OWNERSHIP_RE = /\.eq\(\s*['"`](?:user_?id|owner_?id|author_?id|created_?by|profile_?id|customer_?id|member_?id)['"`]|\b(?:userId|ownerId|authorId|user_id|owner_id|author_id|createdBy|created_by|customerId)\s*:\s*(?:req\.(?:user|session|auth)|session|user|ctx|locals|auth|currentUser|claims)|\bAND\s+"?(?:user_id|owner_id|author_id|created_by)"?\s*=|\b(?:WHERE)\s+"?(?:user_id|owner_id|author_id|created_by)"?\s*=|\.(?:user_?id|owner_?id|author_?id|userId|ownerId)\s*[!=]==?\s*(?:req\.user|(?:req\.)?session\??\.user|user|currentUser)\??\.id|auth\.uid\(\)|\buserClient\(|\bcreateServerClient\(|\bcreateRouteHandlerClient\(|\bcreateServerComponentClient\(/;
 
 async function run(root, opts = {}) {
   const repo = loadRepo(root, opts);
@@ -1050,7 +1112,8 @@ function weakAuth({ repo, server, routes }) {
   let customAuth = false;
   const rules = [
     { re: /createHash\(\s*['"`](md5|sha1|sha256|sha512)['"`]\s*\)\s*\.update\(\s*([^)]*)\)/g, test: (m) => /pass(?:word)?|pwd/i.test(m[2]), note: (m) => `password hashed with fast unsalted ${m[1]}`, list: bad },
-    { re: /\b\w+\??\.(?:password|passwd|pwd)\s*(?:===?|!==?)\s*[\w.]+/g, test: (m) => !/confirm|repeat|again/i.test(m[0]), note: () => 'password compared as plaintext, so passwords are stored unhashed', list: bad },
+    // decrypted integration credentials (CalDAV, SMTP app passwords) are compared in plaintext by design
+    { re: /\b(\w+)\??\.(?:password|passwd|pwd)\s*(?:===?|!==?)\s*[\w.]+/g, test: (m) => !/confirm|repeat|again/i.test(m[0]) && !/decrypt|credential|integration|caldav|smtp|imap|config|settings|options|env/i.test(m[1]), note: () => 'password compared as plaintext, so passwords are stored unhashed', list: bad },
     { re: /\b(?:password|passwd|pwd)\s*(?:===?|!==?)\s*\w+\??\.(?:password|passwd|pwd)\b/g, test: () => true, note: () => 'password compared as plaintext, so passwords are stored unhashed', list: bad },
     { re: /\bbcrypt(?:js)?\.(?:hash|hashSync)\(\s*[^,]+,\s*([0-9]+)\s*\)|\bgenSalt(?:Sync)?\(\s*([0-9]+)\s*\)/g, test: (m) => Number(m[1] || m[2]) < 10, note: (m) => `bcrypt cost ${m[1] || m[2]} is below 10`, list: soft },
     { re: /\bpassword[\w.]*\.length\s*<\s*([1-7])\b/gi, test: () => true, note: (m) => `passwords as short as ${m[1]} characters are accepted`, list: soft },
@@ -1088,7 +1151,7 @@ function missingAuthz(ctx) {
   const open = [];
   let considered = 0;
   for (const r of routes) {
-    if (PUBLIC_PATH_RE.test(r.path)) continue;
+    if (isPublicPath(r.path)) continue;
     const sensitiveGet = (r.method === 'GET' || r.method === 'HEAD') && SENSITIVE_GET_RE.test(r.path);
     if (!isWrite(r) && !sensitiveGet) continue;
     considered++;
@@ -1123,7 +1186,8 @@ function crossUser(ctx) {
   const owned = userOwnedTables(repo);
   const hits = [];
   for (const r of routes) {
-    for (const seg of segments(r)) {
+    if (BATCH_PATH_RE.test(r.path) || ADMIN_PATH_RE.test(r.path)) continue; // cron jobs and admin tools list everything by design (AUTH-04 covers admin auth)
+    for (const seg of segments(r, { helpers: false })) {
     const t = seg.text;
     // Supabase: <client>.from('t').select(…) chains with no owner filter, run with an RLS-bypassing client.
     for (const m of t.matchAll(/\b(\w+)(?:\([^)]*\))?\s*\.from\(\s*['"`](\w+)['"`]\s*\)\s*\.select\(([^)]*)\)((?:\s*\.\s*\w+\([^)]*\))*)/g)) {
@@ -1174,15 +1238,12 @@ function adminRoutes(ctx) {
     else bad.push(ev(r.file.rel, r.line, `${routeLabel(r)} has no authentication or role check anywhere in its chain`, repo.snippet(r.file, r.line)));
   }
   // Admin pages: protection has to happen on the server, not in a client redirect.
-  for (const f of repo.sources({ kinds: ['code'], tests: false, js: true })) {
-    if (!/(?:^|\/)(?:app|pages|routes|src\/pages|src\/routes|src\/app)\/(?:\([^)]*\)\/)?admin(?:\/|\.|$)|(?:^|\/)Admin[\w]*\.(?:jsx|tsx|vue|svelte)$/.test(f.rel)) continue;
-    if (/(?:^|\/)api\//.test(f.rel) || /route\.[cm]?[jt]s$|\+server\./.test(f.rel)) continue;
-    const uiFile = /\.(?:jsx|tsx|vue|svelte|astro)$/.test(f.rel) || /(?:^|\/)page\.[cm]?[jt]sx?$/.test(f.rel);
-    if (!uiFile || repo.side(f) === 'server') continue; // routers are covered above; this is for UI pages
+  for (const page of adminPages(repo)) {
     found++;
-    const text = repo.code(f) || '';
-    const serverGuard = repo.side(f) !== 'client' && (ROLE_RE.test(text) || AUTH_RE.test(text));
-    const mwGuard = nextMiddleware && nextMiddleware.auth && nextMiddleware.covers('/admin');
+    const f = page.file;
+    const guardFiles = [f, ...page.guards];
+    const serverGuard = guardFiles.some((g) => repo.side(g) !== 'client' && guarded(repo, g));
+    const mwGuard = nextMiddleware && nextMiddleware.auth && nextMiddleware.covers(page.path);
     if (serverGuard || mwGuard) continue;
     soft.push(ev(f.rel, 1, repo.side(f) === 'client' ? 'admin page is a client component: any redirect here is cosmetic, so the server routes it calls must check the admin role' : 'admin page with no server-side role check'));
   }
@@ -1192,7 +1253,58 @@ function adminRoutes(ctx) {
   return pass('AUTH-04', [`${found} admin route(s)/page(s) found, each behind a server-side role check.`]);
 }
 
+// Routing directories whose files are pages; components, emails and helpers elsewhere are not.
+const PAGE_DIR_RE = /(?:^|\/)(?:src\/)?(?:app|pages|routes|views|screens)\//;
+const UI_EXT_RE = /\.(?:jsx|tsx|js|ts|mjs|vue|svelte|astro)$/;
+
+/** Admin pages (UI route files under an admin segment) with the server files that can guard them. */
+function adminPages(repo) {
+  const out = [];
+  const files = repo.sources({ kinds: ['code'], tests: false, js: true });
+  const byRel = new Set(files.map((f) => f.rel));
+  for (const f of files) {
+    const m = PAGE_DIR_RE.exec(f.rel);
+    if (!m || !UI_EXT_RE.test(f.rel)) continue;
+    const routePart = f.rel.slice(m.index + m[0].length);
+    const segs = routePart.split('/');
+    // admin, (admin) route groups, admin.users (Remix flat routes), AdminDashboard.tsx; not administration/adminer
+    if (!segs.some((x) => /^[aA]dmin(?:[^a-z]|$)/.test(x.replace(/^[+_]/, '').replace(/^\((.*)\)$/, '$1')))) continue;
+    const base = segs[segs.length - 1];
+    const dir = f.rel.slice(0, f.rel.lastIndexOf('/'));
+    const nextApp = /(?:^|\/)(?:src\/)?app\//.test(f.rel) && repo.depsFor(f.rel).has('next');
+    if (/(?:^|\/)api\//.test(routePart) || /^route\.|^\+server\./.test(base) || /^_(?!admin)|\.d\.ts$|\.(?:test|spec|stories)\./.test(base)) continue;
+    if (nextApp && !/^page\.[cm]?[jt]sx?$/.test(base)) continue; // app router: only page files are routes
+    if (/^\+/.test(base) && !/^\+page\.svelte$/.test(base)) continue; // SvelteKit: the page, guarded by its server files
+    if (!nextApp && !/^\+/.test(base) && repo.side(f) === 'server' && !/\.(?:jsx|tsx|vue|svelte|astro)$/.test(base)) continue; // routers: covered by the route check
+    const guards = [];
+    // ancestor layouts (Next app router, Remix parent routes) and SvelteKit server load files
+    const parts = dir.split('/');
+    for (let i = parts.length; i > 0; i--) {
+      const d = parts.slice(0, i).join('/');
+      for (const name of ['layout.tsx', 'layout.jsx', 'layout.ts', 'layout.js', '+layout.server.ts', '+layout.server.js', '+page.server.ts', '+page.server.js', '+layout.ts', '+layout.js']) {
+        if (byRel.has(`${d}/${name}`)) guards.push(repo.get(`${d}/${name}`));
+      }
+      if (d.endsWith('/app') || d === 'app' || d.endsWith('/routes') || d === 'routes') break;
+    }
+    for (const hook of ['src/hooks.server.ts', 'src/hooks.server.js']) if (byRel.has(hook)) guards.push(repo.get(hook));
+    const routePath = `/${routePart.replace(/\/(?:page|\+page|index)\.[\w]+$|\.[\w]+$/, '').replace(/\([^)]*\)\//g, '')}`;
+    out.push({ file: f, guards, path: routePath });
+  }
+  return out;
+}
+
+/** Does this file (or a helper it calls, one import hop away) check auth or the admin role? */
+function guarded(repo, f) {
+  const text = repo.code(f) || '';
+  if (ROLE_RE.test(text) || AUTH_RE.test(text)) return true;
+  return fileHelpers(repo, f).some((h) => ROLE_RE.test(h.text) || AUTH_RE.test(h.text));
+}
+
 // ── AUTH-05 ────────────────────────────────────────────────────────────────
+
+const FLAG_NAME_RE = /^(?:is|has|should|can|was|did|created|updated|sent|last)[A-Z_]|[vV]alid|[eE]xpir/;
+const TIMESTAMP_NAME_RE = /(?:[a-z0-9](?:Time|Timestamp|Date|Until|Count|Attempts?|Length|At|Ttl|TTL|Age|Exp)|_(?:time|timestamp|date|until|count|attempts?|length|at|ttl|age|exp))$/;
+const EXPIRY_RE = /expir|ttl|valid_?until|validUntil|maxAge|max_age|\.add\(\s*\d|Date\.now\(\)\s*\+|\+\s*Date\.now\(\)|\bsetex\b|['"]EX['"]|\bexp\s*:|\binterval\s+'|\bmoment\(\)\.add|dayjs\(\)\.add|addMinutes|addHours/i;
 
 function passwordReset({ repo, server, routes }) {
   const bad = [];
@@ -1204,11 +1316,16 @@ function passwordReset({ repo, server, routes }) {
     const text = repo.code(f) || '';
     if (/resetPasswordForEmail|sendPasswordResetEmail|\bforgotPassword\(\s*\{|resetPassword\(\s*\{|@clerk\//.test(text)) managed = true;
     const resetCtx = resetFiles.has(f.rel) || /reset_?token|resetPasswordToken|passwordResetToken|forgot.?password/i.test(text);
-    for (const m of text.matchAll(/\b(?:const|let|var)\s+(\w*(?:token|code|otp|secret|reset|nonce|salt|pin|invite|verification)\w*)\s*=\s*[^;\n]*\b(Math\.random\(\)|Date\.now\(\))/gi)) {
+    for (const m of text.matchAll(/\b(?:const|let|var)\s+(\w*(?:token|code|otp|secret|reset|nonce|salt|pin|invite|verification)\w*)\s*=\s*([^;\n]*)\b(Math\.random\(\)|Date\.now\(\))([^;\n]*)/gi)) {
+      // isTokenValid, tokenExpiresAt, codeTtl… are flags and timestamps, not tokens
+      if (FLAG_NAME_RE.test(m[1]) || TIMESTAMP_NAME_RE.test(m[1])) continue;
+      const expr = `${m[2]}${m[3]}${m[4]}`;
+      if (/[<>]=?|===?|!==?/.test(expr)) continue; // comparisons
+      if (m[3] === 'Date.now()' && /Date\.now\(\)\s*[+-]\s*[\d(A-Z]|[\d)]\s*[+-]\s*Date\.now\(\)|new Date\(/.test(expr)) continue; // expiry arithmetic
       const line = repo.lineOf(f, m.index);
       if (repo.suppressed(f, line)) continue;
       custom = true;
-      bad.push(ev(f.rel, line, `"${m[1]}" is generated with ${m[2]}, which is predictable`, repo.snippet(f, line)));
+      bad.push(ev(f.rel, line, `"${m[1]}" is generated with ${m[3]}, which is predictable`, repo.snippet(f, line)));
     }
     if (!resetCtx) continue;
     custom = true;
@@ -1216,11 +1333,11 @@ function passwordReset({ repo, server, routes }) {
       const line = repo.lineOf(f, m.index);
       soft.push(ev(f.rel, line, 'reset link is built from the request Host header (an attacker can point it at their domain)', repo.snippet(f, line)));
     }
-    for (const m of text.matchAll(/['"`][^'"`\n]*(?:user not found|no user|not registered|does not exist|doesn't exist|no account|unknown email)[^'"`\n]*['"`]/gi)) {
+    for (const m of /(?:^|\/)admin\//i.test(f.rel) ? [] : text.matchAll(/['"`][^'"`\n]*(?:user not found|no user|not registered|does not exist|doesn't exist|no account|unknown email)[^'"`\n]*['"`]/gi)) {
       const line = repo.lineOf(f, m.index);
       soft.push(ev(f.rel, line, 'reset flow tells callers whether an email is registered (user enumeration)', repo.snippet(f, line)));
     }
-    if (/reset_?token|resetPasswordToken|passwordResetToken/i.test(text) && !/expir|ttl|valid_?until|validUntil/i.test(text)) {
+    if (/reset_?token|resetPasswordToken|passwordResetToken/i.test(text) && !EXPIRY_RE.test(text)) {
       const idx = text.search(/reset_?token|resetPasswordToken|passwordResetToken/i);
       soft.push(ev(f.rel, repo.lineOf(f, idx), 'reset tokens are stored with no expiry', repo.snippet(f, repo.lineOf(f, idx))));
     }
@@ -1252,10 +1369,11 @@ function sessions({ repo, server }) {
     for (const m of text.matchAll(/\b(?:jwt|jsonwebtoken)\.sign\(/g)) {
       const call = splitArgs(text, m.index + m[0].length - 1);
       if (!call) continue;
-      const optsArg = call.args[2] ? call.args[2].text : '';
-      const payload = call.args[0] ? call.args[0].text : '';
+      const optsArg = call.args[2] ? definitionOf(text, call.args[2].text) : '';
+      if (optsArg === null) continue; // options built elsewhere: can't tell
+      const payload = definitionOf(text, call.args[0] ? call.args[0].text : '') || '';
       const exp = /expiresIn\s*:\s*(['"`]?)(\d+)\s*([a-z]*)\1/i.exec(optsArg);
-      if (!/expiresIn/.test(optsArg) && !/\bexp\s*:/.test(payload)) add(soft, m.index, 'jwt.sign() sets no expiresIn: these tokens never expire');
+      if (!/expiresIn/.test(optsArg) && !/\bexp\b\s*[:,}]/.test(payload)) add(soft, m.index, 'jwt.sign() sets no expiresIn: these tokens never expire');
       else if (exp) {
         const n = Number(exp[2]);
         const unit = (exp[3] || 's').toLowerCase();
@@ -1285,6 +1403,42 @@ function sessions({ repo, server }) {
   return pass('AUTH-06', ['JWTs are verified and expire; no tokens in localStorage; sessions use a persistent store.']);
 }
 
+/**
+ * Text of an argument: object literals as-is; an identifier resolves to its object-literal
+ * definition in the same file (spreads of other local objects inlined). Returns null when the
+ * value is built elsewhere (an import, a function result) so callers can give it the benefit of the doubt.
+ */
+function definitionOf(text, arg, depth = 0) {
+  if (!arg) return '';
+  if (/^\{/.test(arg)) {
+    if (depth > 2) return arg;
+    let out = arg;
+    for (const m of arg.matchAll(/\.\.\.\s*([A-Za-z_$][\w$]*)/g)) {
+      const inner = definitionOf(text, m[1], depth + 1);
+      if (inner === null) return null;
+      out += `\n${inner}`;
+    }
+    return out;
+  }
+  if (!/^[A-Za-z_$][\w$]*$/.test(arg)) return null;
+  const def = new RegExp(`\\b(?:const|let|var)\\s+${arg}\\s*(?::[^=]{1,200})?=\\s*\\{`).exec(text);
+  if (!def) return null;
+  const open = def.index + def[0].length - 1;
+  const body = splitBraces(text, open);
+  return body === null ? null : definitionOf(text, body, depth + 1);
+}
+
+/** The balanced {…} starting at `open`, or null. */
+function splitBraces(text, open) {
+  let depth = 0;
+  for (let i = open; i < Math.min(text.length, open + 4000); i++) {
+    const ch = text[i];
+    if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return text.slice(open, i + 1);
+  }
+  return null;
+}
+
 // ── AUTH-07 ────────────────────────────────────────────────────────────────
 
 function idor(ctx) {
@@ -1301,7 +1455,7 @@ function idor(ctx) {
   ];
   for (const r of routes) {
     if (OWNERSHIP_RE.test(routeBody(r)) || ROLE_RE.test(chain(r))) continue;
-    for (const seg of segments(r)) {
+    for (const seg of segments(r, { helpers: false })) {
       for (const re of lookups) {
         for (const m of seg.text.matchAll(re)) {
           const arg = m[2] || m[1];
@@ -1399,18 +1553,22 @@ async function cookies(ctx) {
     for (const m of text.matchAll(calls)) {
       const call = splitArgs(text, m.index + m[0].lastIndexOf('('));
       if (!call || !call.args.length) continue;
+      // a helper's own definition (function setCookie(res, token) {…}) is not a call
+      if (/\bfunction\s*$/.test(text.slice(Math.max(0, m.index - 12), m.index)) || /^\s*(?::[^={;]{1,200})?(?:\{|=>)/.test(text.slice(call.end + 1, call.end + 210))) continue;
       any = true;
       const line = repo.lineOf(f, m.index);
       if (repo.suppressed(f, line)) continue;
       const args = call.args.map((a) => a.text);
       const single = args.length === 1 && args[0].startsWith('{');
       const name = single ? (/\bname\s*:\s*['"`]([^'"`]+)/.exec(args[0]) || [])[1] || '' : literalValue(args[0]) || args[0];
-      const options = single ? args[0] : args.slice(2).find((a) => a.startsWith('{')) || '';
+      const options = definitionOf(text, single ? args[0] : args[2] || '');
+      if (options === null) continue; // options come from elsewhere: can't tell
       const valueArg = single ? (/\bvalue\s*:\s*([^,}]+)/.exec(args[0]) || [])[1] || '' : args[1] || '';
       if (!AUTHISH_COOKIE_RE.test(name) && !/token|jwt|session/i.test(valueArg)) continue;
-      const httpOnly = /httpOnly\s*:\s*true/i.test(options) || (svelte && !/httpOnly\s*:\s*false/i.test(options));
-      const secure = /\bsecure\s*:\s*(?:true|process\.env|!dev|isProd|prod)/i.test(options) || (svelte && !/\bsecure\s*:\s*false/i.test(options));
-      const sameSite = /sameSite\s*:\s*['"`]?(?:lax|strict)/i.test(options) || (svelte && !/sameSite\s*:\s*['"`]?none/i.test(options));
+      // shorthand ({ httpOnly, secure }) and computed values get the benefit of the doubt
+      const httpOnly = /httpOnly\s*:\s*(?!false\b)[\w!(]/i.test(options) || /[{,]\s*httpOnly\s*[,}]/i.test(options) || (svelte && !/httpOnly\s*:\s*false/i.test(options));
+      const secure = /\bsecure\s*:\s*(?!false\b)[\w!(]/i.test(options) || /[{,]\s*secure\s*[,}]/i.test(options) || (svelte && !/\bsecure\s*:\s*false/i.test(options));
+      const sameSite = /sameSite\s*:\s*(?:['"`]?(?:lax|strict)|(?!['"`]|none\b)[\w(])/i.test(options) || /[{,]\s*sameSite\s*[,}]/i.test(options) || (svelte && !/sameSite\s*:\s*['"`]?none/i.test(options));
       const missing = [!httpOnly && 'HttpOnly', !secure && 'Secure', !sameSite && 'SameSite'].filter(Boolean);
       if (!missing.length) continue;
       (missing.includes('HttpOnly') ? bad : soft).push(ev(f.rel, line, `auth cookie "${name}" is set without ${missing.join(', ')}`, repo.snippet(f, line)));
@@ -1450,7 +1608,7 @@ async function cookies(ctx) {
   return pass('AUTH-10', ['Auth/session cookies are set with HttpOnly, Secure and SameSite.']);
 }
 
-module.exports = { name: 'auth', ids: IDS, run, PUBLIC_PATH_RE, isProtected };
+module.exports = { name: 'auth', ids: IDS, run, PUBLIC_PATH_RE, isPublicPath, isProtected };
 },
 // ── checks/comms.js ───────────────────────────────────────────────────────
 "checks/comms.js": function (module, exports, require) {
@@ -1463,9 +1621,10 @@ module.exports = { name: 'auth', ids: IDS, run, PUBLIC_PATH_RE, isProtected };
  */
 
 const { loadRepo } = require('../lib/repo');
-const { getRoutes, routeBody } = require('../lib/routes');
+const { getRoutes, routeBody, segments } = require('../lib/routes');
+const { AUTH_RE } = require('../lib/primitives');
 const { taintedNames, isTainted } = require('../lib/taint');
-const { pass, fail, manual, na, ev } = require('../lib/result');
+const { pass, fail, warn, manual, na, ev } = require('../lib/result');
 const { splitArgs, objectAt } = require('../lib/util');
 
 const IDS = ['LEGAL-01', 'LEGAL-03', 'APP-12'];
@@ -1484,7 +1643,7 @@ const SMS_PROVIDERS = [
 ];
 const CONSENT_RE = /\b(?:sms_?consent|smsConsent|consent(?:ed)?_?at|consentedAt|opt_?in|optIn|opted_?in|optedIn|tcpa|marketing_?consent|sms_?opt)\b/i;
 const OPTOUT_RE = /['"`](?:STOP|UNSUBSCRIBE|STOPALL|CANCEL|QUIT)['"`]|\bopt_?out\b|\boptOut\b|\bopted_?out\b|\bunsubscribed\b/i;
-const VERIFY_RE = /constructEvent(?:Async)?\s*\(|\bwebhooks\.(?:constructEvent|verify|unwrap|verifySignature)\s*\(|validateRequest(?:WithBody)?\s*\(|\btwilio\.webhook\s*\(|\bnew\s+Webhook\s*\(|\bwh\.verify\s*\(|verifyWebhook\s*\(|verifySignature\s*\(|validateSignature\s*\(|isValidSignature|checkSignature|verify_signature|timingSafeEqual\s*\(|crypto\.subtle\.verify\s*\(|paddle\.webhooks\.unmarshal|validateWebhookSignature|shopify\.webhooks\.validate|@octokit\/webhooks|verifyAndReceive|standardwebhooks|from\s+['"]svix['"]|require\(\s*['"]svix['"]\s*\)/;
+const VERIFY_RE = /construct\w*Event(?:Async)?\s*\(|\bwebhooks\.(?:constructEvent|verify|unwrap|verifySignature)\s*\(|validateRequest(?:WithBody)?\s*\(|\btwilio\.webhook\s*\(|\bnew\s+Webhook\s*\(|\bwh\.verify\s*\(|verifyWebhook\s*\(|verifySignature\s*\(|validateSignature\s*\(|isValidSignature|checkSignature|verify_signature|timingSafeEqual\s*\(|crypto\.subtle\.verify\s*\(|paddle\.webhooks\.unmarshal|validateWebhookSignature|shopify\.webhooks\.validate|@octokit\/webhooks|verifyAndReceive|standardwebhooks|from\s+['"]svix['"]|require\(\s*['"]svix['"]\s*\)/;
 
 async function run(root, opts = {}) {
   const repo = loadRepo(root, opts);
@@ -1598,11 +1757,37 @@ function payments(repo, code) {
 
 // ── APP-12 ─────────────────────────────────────────────────────────────────
 
+// An HMAC computed and compared by hand, or a secret request header compared with a stored secret.
+const SIG_COMPARE_RE = /[!=]==?\s*[\w.[\]('"-]*(?:sig|hmac|signed|digest)|(?:sig|hmac|signed|digest)[\w-]*['"\])]*\s*[!=]==?/i;
+const HEADER_SECRET_RE = /headers[\s\S]{0,300}?\b\w*(?:secret|token)\w*\s*[!=]==?\s*(?:process\.env\.)?\w*(?:secret|token)\w*/i;
+const manualVerify = (t) => (/createHmac\s*\(|crypto\.subtle\.(?:sign|importKey)\s*\(/.test(t) && SIG_COMPARE_RE.test(t)) || HEADER_SECRET_RE.test(t);
+// Reads the request body itself…
+const READS_BODY_RE = /\b(?:req|request|event|ctx|c)\b[\w.]*\.(?:body|json\(|text\(|arrayBuffer\(|formData\(|rawBody|on\(\s*['"]data)|\b(?:buffer|getRawBody|rawBody|readBody|text|json)\(\s*(?:req|request|event)\b/;
+// …or hands the request object to another function.
+const FORWARDS_REQ_RE = /\b([A-Za-z_$][\w$.]*)\s*\([^()]*\b(?:req|request)\b\s*[,)]/g;
+const NOT_FORWARDING_RE = /^(?:NextResponse|Response|res|reply|console|log|logger)\b|\.(?:json|send|status|end|redirect|get|headers)$|^(?:function|handler|postHandler|defaultResponder\w*|withMiddleware|wrap\w*)$/;
+
+/** First function the request object is passed to (not the handler's own definition), or null. */
+function forwardTarget(text) {
+  for (const m of text.matchAll(FORWARDS_REQ_RE)) {
+    if (NOT_FORWARDING_RE.test(m[1])) continue;
+    const close = text.indexOf(')', m.index + m[0].length - 1);
+    if (/^\s*(?::[^={;]{0,200})?(?:\{|=>)/.test(text.slice(close + 1, close + 210))) continue; // webhook(req, res) { … }: a definition
+    return m[1];
+  }
+  return null;
+}
+
 function webhooks(repo) {
   const { routes } = getRoutes(repo);
   const candidates = new Map();
   for (const r of routes) {
-    if (/webhook/i.test(r.path) || /webhook/i.test(r.file.rel) || (r.handler && /webhook/i.test(r.handler.file.rel))) candidates.set(`${r.file.rel}:${r.line}`, r);
+    if (!['POST', 'PUT', 'ANY', 'ALL'].includes(r.method)) continue; // providers POST events; GET /webhooks lists them
+    if (r.framework === 'server-action' || /(?:^|\/)trpc(?:\/|$)/.test(r.path)) continue; // providers can't call server actions or tRPC
+    if (!(/webhook/i.test(r.path) || /webhook/i.test(r.file.rel) || (r.handler && /webhook/i.test(r.handler.file.rel)))) continue;
+    // A signed-in user's endpoint (creating webhook subscriptions, admin tools) is not a receiver.
+    if ((AUTH_RE.test(`${r.mountMiddleware || ''}\n${routeBody(r)}`) && !VERIFY_RE.test(routeBody(r))) || /@UseGuards/.test(r.mountMiddleware || '')) continue;
+    candidates.set(`${r.file.rel}:${r.line}`, r);
   }
   if (!candidates.size) {
     const files = repo.sources({ kinds: ['code'], tests: false }).filter((f) => repo.side(f) !== 'client' && /webhook/i.test(f.rel) && !repo.isTooling(f));
@@ -1611,16 +1796,29 @@ function webhooks(repo) {
     return bad.length ? fail('APP-12', bad) : pass('APP-12', files.map((f) => ev(f.rel, null, 'webhook signature verified')));
   }
   const bad = [];
+  const soft = [];
   const ok = [];
   for (const r of candidates.values()) {
-    const texts = [routeBody(r), repo.code(r.file) || ''];
+    const body = routeBody(r);
+    const texts = [body, repo.code(r.file) || ''];
     if (r.handler) texts.push(repo.code(r.handler.file) || '');
-    const verified = texts.some((t) => VERIFY_RE.test(t)) || VERIFY_RE.test(r.mountMiddleware || '');
+    const verified = texts.some((t) => VERIFY_RE.test(t) || manualVerify(t)) || VERIFY_RE.test(r.mountMiddleware || '');
     const where = r.handler && r.handler.file !== r.file ? ` (handler in ${r.handler.file.rel}:${repo.lineOf(r.handler.file, r.handler.start)})` : '';
-    if (verified) ok.push(ev(r.file.rel, r.line, `${r.method} ${r.path} verifies the signature`));
+    if (verified) {
+      ok.push(ev(r.file.rel, r.line, `${r.method} ${r.path} verifies the signature`));
+      continue;
+    }
+    // Reads the body itself: unverified. Only hands the request on: verification may be in there.
+    // Neither (a stub returning 404/410): receives nothing.
+    const own = segments(r, { helpers: false }).map((x) => x.text).join('\n');
+    const forwardedTo = forwardTarget(own);
+    if (!READS_BODY_RE.test(own) && !forwardedTo) continue;
+    if (!READS_BODY_RE.test(own)) soft.push(ev(r.file.rel, r.line, `${r.method} ${r.path} hands the request to ${forwardedTo}() and no signature check is visible here${where}`, repo.snippet(r.file, r.line)));
     else bad.push(ev(r.file.rel, r.line, `${r.method} ${r.path} accepts webhook events without verifying the provider's signature${where}`, repo.snippet(r.file, r.line)));
   }
-  if (bad.length) return fail('APP-12', [...bad, ...ok]);
+  if (bad.length) return fail('APP-12', [...bad, ...soft, ...ok]);
+  if (!soft.length && !ok.length) return na('APP-12', 'webhook routes found, but none of them read the request (stubs)');
+  if (soft.length) return warn('APP-12', [...soft, ...ok], { question: 'Does the function each webhook hands its request to verify the provider\'s signature (or a shared secret) before acting on the event?' });
   return pass('APP-12', ok);
 }
 
@@ -1647,7 +1845,43 @@ const IDS = ['DATA-03', 'DATA-04', 'DATA-05', 'DATA-06', 'DATA-07'];
 const IDENT = '(?:"?[A-Za-z_][\\w$]*"?\\.)?"?[A-Za-z_][\\w$]*"?';
 const POLICY_RE = new RegExp(`\\bcreate\\s+policy\\s+(?:"[^"]*"|[\\w$]+)\\s+on\\s+(${IDENT})([\\s\\S]*?);`, 'gi');
 const VIEW_RE = new RegExp(`\\bcreate\\s+(?:or\\s+replace\\s+)?view\\s+(${IDENT})([\\s\\S]*?)\\bas\\b`, 'gi');
-const SECURITY_DEFINER_FN_RE = /\bcreate\s+(?:or\s+replace\s+)?function\s+(?:public\.)?"?(\w+)"?[\s\S]{0,2000}?\bsecurity\s+definer\b/gi;
+const CREATE_FN_RE = /\bcreate\s+(?:or\s+replace\s+)?function\s+(?:"?\w+"?\.)?"?(\w+)"?/gi;
+
+/**
+ * Whole CREATE FUNCTION statements: header, body (dollar-quoted or single-quoted) and the
+ * trailing options, up to the terminating semicolon. `options` excludes the body, so a
+ * SECURITY DEFINER written inside a function's code doesn't count.
+ */
+function sqlFunctions(sql) {
+  const out = [];
+  for (const m of sql.matchAll(CREATE_FN_RE)) {
+    let i = m.index + m[0].length;
+    let options = '';
+    let end = sql.length;
+    for (let guard = 0; i < sql.length && guard < 200000; guard++) {
+      const rest = sql.slice(i);
+      const next = rest.search(/\$[A-Za-z_]*\$|'|;/);
+      if (next === -1) break;
+      options += rest.slice(0, next);
+      const at = i + next;
+      if (sql[at] === ';') {
+        end = at + 1;
+        break;
+      }
+      if (sql[at] === "'") {
+        let j = at + 1;
+        while (j < sql.length && !(sql[j] === "'" && sql[j + 1] !== "'")) j += sql[j] === "'" ? 2 : 1;
+        i = j + 1;
+      } else {
+        const tag = /^\$[A-Za-z_]*\$/.exec(sql.slice(at))[0];
+        const close = sql.indexOf(tag, at + tag.length);
+        i = close === -1 ? sql.length : close + tag.length;
+      }
+    }
+    out.push({ name: m[1], index: m.index, options, text: sql.slice(m.index, end) });
+  }
+  return out;
+}
 const CREATE_TABLE_BODY_RE = new RegExp(`\\bcreate\\s+(?:unlogged\\s+)?table\\s+(?:if\\s+not\\s+exists\\s+)?(${IDENT})\\s*\\(`, 'gi');
 
 const CARD_COLUMN_RE = /^(?:card_?number|cc_?number|credit_?card(?:_?number)?|cardnum|card_?no|pan|cvv2?|cvc2?|card_?cvc|card_?cvv|card_?security_?code|security_?code)$/;
@@ -1727,6 +1961,7 @@ function openRules(repo) {
     if (!repo.suppressed(f, line)) list.push(ev(f.rel, line, note, repo.snippet(f, line)));
   };
   let checkedSomething = false;
+  const supabase = usesSupabase(repo);
   for (const f of repo.files) {
     if (f.build) continue;
     const text = repo.code(f);
@@ -1758,11 +1993,17 @@ function openRules(repo) {
         if ((usingTrue || checkTrue) && cmd !== 'select') add(bad, f, m.index, `policy on ${table} lets ${roles === 'public' ? 'anyone' : roles} ${cmd === 'all' ? 'read and write' : cmd} with an always-true condition`);
         else if (usingTrue && cmd === 'select') add(soft, f, m.index, `policy on ${table} makes every row readable by ${roles === 'public' ? 'anyone, including anonymous users' : roles}`);
       }
-      for (const m of clean.matchAll(VIEW_RE)) {
-        const name = m[1].replace(/"/g, '');
-        if (/^(?:public\.)?\w+$/.test(name) && !/security_invoker/i.test(m[2])) add(soft, f, m.index, `view ${name} runs with its owner's privileges and bypasses RLS (add "with (security_invoker = true)")`);
+      // Owner-privileged views and definer functions only bypass anything where the API exposes
+      // the schema under RLS (Supabase/PostgREST); in a plain Postgres app they are normal.
+      if (supabase) {
+        for (const m of clean.matchAll(VIEW_RE)) {
+          const name = m[1].replace(/"/g, '');
+          if (/^(?:public\.)?\w+$/.test(name) && !/security_invoker/i.test(m[2])) add(soft, f, m.index, `view ${name} runs with its owner's privileges and bypasses RLS (add "with (security_invoker = true)")`);
+        }
+        for (const fn of sqlFunctions(clean)) {
+          if (/\bsecurity\s+definer\b/i.test(fn.options) && !/\bset\s+search_path\b/i.test(fn.text)) add(soft, f, fn.index, `security definer function ${fn.name} has no fixed search_path`);
+        }
       }
-      for (const m of clean.matchAll(SECURITY_DEFINER_FN_RE)) if (!/set\s+search_path/i.test(m[0])) add(soft, f, m.index, `security definer function ${m[1]} has no fixed search_path`);
       for (const m of clean.matchAll(/insert\s+into\s+storage\.buckets\s*\(([^)]*)\)\s*values\s*\(([^)]*)\)/gi)) {
         const colsList = m[1].split(',').map((s) => s.trim().replace(/"/g, ''));
         const vals = m[2].split(',').map((s) => s.trim());
@@ -1776,7 +2017,9 @@ function openRules(repo) {
     }
     if (f.kind === 'config' && /^docker-compose|compose\.ya?ml$/.test(f.name)) {
       checkedSomething = true;
-      for (const m of text.matchAll(/POSTGRES_HOST_AUTH_METHOD\s*[:=]\s*["']?trust/g)) add(bad, f, m.index, 'Postgres accepts connections without a password (trust auth)');
+      // trust auth is an open database once the port is reachable: fail when Postgres is published on all interfaces
+      const pgPublished = /^\s*-\s*["']?(?:0\.0\.0\.0:)?\d+:5432\b/m.test(text);
+      for (const m of text.matchAll(/POSTGRES_HOST_AUTH_METHOD\s*[:=]\s*["']?trust/g)) add(pgPublished ? bad : soft, f, m.index, `Postgres accepts connections without a password (trust auth)${pgPublished ? ', and its port is published on all interfaces' : ''}`);
       for (const m of text.matchAll(/xpack\.security\.enabled\s*[:=]\s*["']?false/g)) add(soft, f, m.index, 'Elasticsearch security is disabled');
       for (const m of text.matchAll(/^\s*-\s*["']?(?:0\.0\.0\.0:)?(5432|3306|27017|6379|9200|5672|1433):\d+["']?\s*$/gm)) add(soft, f, m.index, `database port ${m[1]} is published on all interfaces; on a server this is reachable from the internet`);
     }
@@ -1936,7 +2179,7 @@ function backups(repo) {
   return manual('DATA-07', evidence);
 }
 
-module.exports = { name: 'data', ids: IDS, run, collectColumns };
+module.exports = { name: 'data', ids: IDS, run, collectColumns, sqlFunctions };
 },
 // ── checks/deps.js ────────────────────────────────────────────────────────
 "checks/deps.js": function (module, exports, require) {
@@ -1966,7 +2209,7 @@ const LOCKFILES = [
 ];
 
 // Popular packages: lookalikes one edit away from these are suspicious (unless popular themselves).
-const POPULAR = new Set(`react react-dom next vue nuxt svelte @sveltejs/kit angular express koa fastify hono nestjs lodash underscore axios got node-fetch superagent request moment dayjs date-fns luxon uuid nanoid chalk debug commander yargs minimist dotenv cross-env nodemon ts-node typescript eslint prettier jest mocha chai vitest vite webpack rollup esbuild parcel babel-core @babel/core tailwindcss postcss autoprefixer sass less styled-components emotion classnames clsx jquery bootstrap three d3 chart.js recharts mongoose mongodb mysql mysql2 pg postgres sequelize knex prisma @prisma/client drizzle-orm redis ioredis bull bullmq socket.io ws graphql apollo-server stripe twilio openai @anthropic-ai/sdk nodemailer multer helmet cors morgan passport jsonwebtoken bcrypt bcryptjs argon2 cookie-parser express-session body-parser zod yup joi valibot ajv react-router react-router-dom redux @reduxjs/toolkit zustand jotai swr @tanstack/react-query framer-motion lucide-react react-icons @mui/material antd firebase firebase-admin @supabase/supabase-js aws-sdk sharp jimp puppeteer playwright cheerio jsdom marked markdown-it highlight.js prismjs xml2js js-yaml yaml qs query-string validator crypto-js node-forge jose jwt-decode form-data mime mime-types ms semver glob rimraf mkdirp fs-extra chokidar inquirer ora boxen colors color picocolors kleur winston pino bunyan handlebars ejs pug nunjucks mustache lru-cache node-cache keyv ethers web3 viem wagmi discord.js telegraf electron react-native expo immer rxjs core-js regenerator-runtime tslib async bluebird p-limit execa shelljs concurrently husky lint-staged nodemailer-express-handlebars i18next react-i18next formik react-hook-form preact solid-js lit alpinejs htmx.org astro gatsby remix @remix-run/react @vercel/analytics @vercel/og ai @ai-sdk/openai langchain @langchain/core replicate cohere-ai groq-sdk @google/generative-ai @google/genai resend @sendgrid/mail mailgun.js plivo @vonage/server-sdk telnyx ua-parser-js event-stream eslint-scope coa rc node-ipc faker @faker-js/faker colors-cli supports-color ansi-styles strip-ansi ansi-regex wrap-ansi color-convert color-name is-arrayish slice-ansi color-string simple-swizzle has-ansi chalk-template backslash error-ex @ctrl/tinycolor tinycolor2 mariadb sqlite3 better-sqlite3 cookie cookies serve-static compression express-rate-limit rate-limiter-flexible @upstash/ratelimit @upstash/redis svix @clerk/nextjs next-auth @auth/core lucia better-auth`.split(/\s+/));
+const POPULAR = new Set(`react react-dom next vue nuxt svelte @sveltejs/kit angular express koa fastify hono nestjs lodash underscore axios got node-fetch superagent request moment dayjs date-fns luxon uuid nanoid chalk debug commander yargs minimist dotenv cross-env nodemon ts-node typescript eslint prettier jest mocha chai vitest vite webpack rollup esbuild parcel babel-core @babel/core tailwindcss postcss autoprefixer sass less styled-components emotion classnames clsx jquery bootstrap three d3 chart.js recharts mongoose mongodb mysql mysql2 pg postgres sequelize knex prisma @prisma/client drizzle-orm redis ioredis bull bullmq socket.io ws graphql apollo-server stripe twilio openai @anthropic-ai/sdk nodemailer multer helmet cors morgan passport jsonwebtoken bcrypt bcryptjs argon2 cookie-parser express-session body-parser zod yup joi valibot ajv react-router react-router-dom redux @reduxjs/toolkit zustand jotai swr @tanstack/react-query framer-motion lucide-react react-icons @mui/material antd firebase firebase-admin @supabase/supabase-js aws-sdk sharp jimp puppeteer playwright cheerio jsdom marked markdown-it highlight.js prismjs xml2js js-yaml yaml qs query-string validator crypto-js node-forge jose jwt-decode form-data mime mime-types ms semver glob rimraf mkdirp fs-extra chokidar inquirer ora boxen colors color picocolors kleur winston pino bunyan handlebars ejs pug nunjucks mustache lru-cache node-cache keyv ethers web3 viem wagmi discord.js telegraf electron react-native expo immer rxjs core-js regenerator-runtime tslib async bluebird p-limit execa shelljs concurrently husky lint-staged nodemailer-express-handlebars i18next react-i18next formik react-hook-form preact solid-js lit alpinejs htmx.org astro gatsby remix @remix-run/react @vercel/analytics @vercel/og ai @ai-sdk/openai langchain @langchain/core replicate cohere-ai groq-sdk @google/generative-ai @google/genai resend @sendgrid/mail mailgun.js plivo @vonage/server-sdk telnyx ua-parser-js event-stream eslint-scope coa rc node-ipc faker @faker-js/faker colors-cli supports-color ansi-styles strip-ansi ansi-regex wrap-ansi color-convert color-name is-arrayish slice-ansi color-string simple-swizzle has-ansi chalk-template backslash error-ex @ctrl/tinycolor tinycolor2 mariadb sqlite3 better-sqlite3 cookie cookies serve-static compression motion querystring punycode events buffer util url path-browserify string_decoder express-rate-limit rate-limiter-flexible @upstash/ratelimit @upstash/redis svix @clerk/nextjs next-auth @auth/core lucia better-auth`.split(/\s+/));
 
 // Packages published as malware (2017 "hacktask" typosquats and later incidents). Any version.
 const MALICIOUS_NAMES = new Set(['crossenv', 'cross-env.js', 'd3.js', 'fabric-js', 'ffmepg', 'gruntcli', 'http-proxy.js', 'jquery.js', 'mongose', 'mssql.js', 'mssql-node', 'mysqljs', 'nodecaffe', 'nodefabric', 'node-fabric', 'nodeffmpeg', 'nodemailer-js', 'nodemailer.js', 'nodemssql', 'node-opencv', 'node-opensl', 'node-openssl', 'noderequest', 'nodesass', 'nodesqlite', 'node-tkinter', 'opencv.js', 'openssl.js', 'proxy.js', 'shadowsock', 'smb', 'sqlite.js', 'sqliter', 'sqlserver', 'tkinter', 'flatmap-stream', 'getcookies', 'electorn', 'discordi.js']);
@@ -2195,6 +2438,7 @@ function lockfiles({ repo, pkgs }) {
   if (!pkgs.length) return na('DEP-02', 'no package.json with dependencies (nothing to lock)');
   const bad = [];
   const soft = [];
+  const workspaceNames = new Set(repo.packages.map((x) => x.json && x.json.name).filter(Boolean));
   for (const p of pkgs) {
     const lock = lockFor(repo, p);
     if (!lock) {
@@ -2203,6 +2447,7 @@ function lockfiles({ repo, pkgs }) {
     }
     if (repo.git.isRepo && repo.git.isTracked(lock.f.rel) === false && repo.git.isIgnored(lock.f.rel)) soft.push(ev(lock.f.rel, null, 'lockfile is gitignored, so CI and production installs are unpinned'));
     for (const [name, v] of Object.entries(p.versions)) {
+      if (v.section === 'peerDependencies' || workspaceNames.has(name)) continue; // peer ranges float by design; "*" on a workspace package links it
       if (/^(?:\*|latest|x|)$/.test(v.range.trim()) || /^>=?\s*\d/.test(v.range.trim())) soft.push(ev(p.rel, depLine(p, name), `"${name}": "${v.range}" floats to whatever is newest`));
     }
   }
@@ -2272,7 +2517,9 @@ function supplyChain({ repo, pkgs }) {
       const range = v.range.trim();
       if (/^(?:git\+|git:|github:|gitlab:|bitbucket:|https?:\/\/)|^[\w.-]+\/[\w.-]+(?:#.*)?$/.test(range)) soft.push(ev(p.rel, line, `"${name}" installs from ${range} instead of the npm registry (unreviewed, unpinned source)`));
       if (!POPULAR.has(name) && !name.startsWith('@')) {
-        const twin = [...POPULAR].find((pop) => pop.length >= 5 && !pop.startsWith('@') && pop !== name && (distance(name, pop) === 1 || name === `${pop}.js`));
+        // separator-only variants (querystring/query-string) are usually distinct real packages; known bad ones are in MALICIOUS_NAMES
+        const bare = (x) => x.replace(/[-_.]/g, '');
+        const twin = [...POPULAR].find((pop) => pop.length >= 5 && !pop.startsWith('@') && pop !== name && bare(pop) !== bare(name) && (distance(name, pop) === 1 || name === `${pop}.js`));
         if (twin) soft.push(ev(p.rel, line, `"${name}" is one character away from the popular package "${twin}": make sure it's the one you meant`));
       }
     }
@@ -2315,6 +2562,7 @@ module.exports = { name: 'deps', ids: IDS, run, parseAudit, distance, lockFor };
 const { loadRepo } = require('../lib/repo');
 const P = require('../lib/patterns');
 const { pass, fail, warn, na, ev } = require('../lib/result');
+const { entropy } = require('../lib/util');
 
 const IDS = ['SEC-02', 'SEC-08'];
 
@@ -2368,6 +2616,14 @@ function strongLabel(e) {
   return null;
 }
 
+/** Example-file values that match no provider format but look like a real random secret. */
+function randomLooking(e) {
+  const v = e.value;
+  if (!v || P.isPlaceholder(v) || P.PUBLIC_VALUE_RE.test(v) || !SECRETISH_NAME_RE.test(e.name) || P.PUBLIC_NAME_RE.test(e.name)) return false;
+  if (v.length < 24 || /\s/.test(v) || /^https?:\/\//i.test(v) || /^[a-z]+(?:[_-][a-z0-9]+)+$/i.test(v)) return false; // words-with-dashes placeholders
+  return entropy(v) >= 3.5;
+}
+
 function envFilesCheck(repo) {
   const files = repo.envFiles();
   if (!files.length) return na('SEC-02', 'no .env files in the repo');
@@ -2383,7 +2639,9 @@ function envFilesCheck(repo) {
     const line = secrets.length ? secrets[0].e.line : 1;
     const holds = secrets.length ? `holds ${secrets.length} secret-looking value${secrets.length > 1 ? 's' : ''} (first: ${secrets[0].label}, line ${secrets[0].e.line})` : 'holds no secret-looking values right now';
     if (example) {
+      const odd = secrets.length ? [] : entries.filter(randomLooking);
       if (secrets.length) failing.push(ev(f.rel, line, `example env file contains a real-looking secret (${secrets[0].label}); example files are committed and public`));
+      else if (odd.length) warning.push(ev(f.rel, odd[0].line, `example env file has a random-looking ${odd.map((e) => e.name).slice(0, 3).join(', ')} value; if it was ever used for real, rotate it (example files are committed and public)`));
       else fine.push(ev(f.rel, null, 'example file with placeholders only (fine to commit)'));
       continue;
     }
@@ -3003,7 +3261,7 @@ function collector(repo) {
 }
 
 const result = (id, hits, okText) => (hits.length ? warn(id, hits) : pass(id, [okText]));
-const sanitizedVar = (text, name) => new RegExp(`\\b${name.replace(/[$]/g, '\\$')}\\s*=\\s*[^;\\n]*${SANITIZER_RE.source}`).test(text);
+const sanitizedVar = (text, name) => new RegExp(`\\b${name.replace(/[$]/g, '\\$')}\\s*=\\s*[^;\\n]*(?:${SANITIZER_RE.source})`).test(text);
 
 // ── APP-01 ─────────────────────────────────────────────────────────────────
 
@@ -3012,10 +3270,14 @@ function xss({ repo, all, tainted }) {
   for (const f of all) {
     const text = repo.code(f) || '';
     const dynamic = (expr) => {
-      const e = expr.trim();
+      const e = expr.trim().replace(/,$/, '').trim();
       if (literalValue(e) !== null || /^['"`]\s*['"`]$/.test(e)) return false;
       if (SANITIZER_RE.test(e)) return false;
       if (/^[A-Za-z_$][\w$]*$/.test(e) && sanitizedVar(text, e)) return false;
+      // props.safeBio, descriptionAsSafeHtml, escapedTitle: named as already sanitized
+      if (/^[\w$.?]+$/.test(e) && /(?:^|[.?])[\w$]*(?:[sS]afe|[sS]anitized|[eE]scaped|[pP]urified)[\w$]*$/.test(e)) return false;
+      // templates that only interpolate constants (`…${GTM_ID}…`, `${process.env.X}`)
+      if (e.startsWith('`') && interpolations(e).every((x) => /^(?:[A-Z][A-Z0-9_]*|process\.env\.\w+|import\.meta\.env\.\w+|\d+)$/.test(x))) return false;
       return true;
     };
     for (const m of text.matchAll(/dangerouslySetInnerHTML\s*=\s*\{\s*\{\s*__html\s*:\s*([\s\S]*?)\}\s*\}/g)) if (dynamic(m[1])) c.add(f, m.index, `dangerouslySetInnerHTML renders ${m[1].trim().slice(0, 40)} without a sanitizer`);
@@ -3058,6 +3320,7 @@ function sqli({ repo, server, tainted }) {
       if (!SQL_KEYWORD_RE.test(sql.replace(/^\(+/, ''))) continue;
       if (!isDynamicString(sql)) continue;
       const userData = isTainted(sql, names);
+      if (!userData && sql.startsWith('`') && interpolations(sql).every((e) => safeInterpolation(e, defs))) continue;
       c.add(f, at, `SQL built with ${sql.startsWith('`') ? 'a template literal' : 'string concatenation'}${userData ? ' from request data' : ''}`);
     }
     for (const m of text.matchAll(/\.(?:or|filter|textSearch|match)\(\s*`[^`]*\$\{([^}]+)\}/g)) if (isTainted(m[1], names)) c.add(f, m.index, 'PostgREST filter string interpolates request data (filter injection)');
@@ -3067,6 +3330,39 @@ function sqli({ repo, server, tainted }) {
     for (const m of text.matchAll(/\.execute\(\s*(?:f["']|["'][^"'\n]*["']\s*%|["'][^"'\n]*["']\s*\.format\(|["'][^"'\n]*["']\s*\+)/g)) c.add(f, m.index, 'SQL built with an f-string, % or .format()');
   }
   return result('APP-02', c.hits, 'No SQL built from template literals or string concatenation found; queries use parameters or tagged templates.');
+}
+
+/** The ${…} expressions of a template literal (top level, nested braces balanced). */
+function interpolations(tpl) {
+  const out = [];
+  for (let i = tpl.indexOf('${'); i !== -1; i = tpl.indexOf('${', i + 1)) {
+    let depth = 0;
+    for (let j = i + 1; j < tpl.length; j++) {
+      if (tpl[j] === '{') depth++;
+      else if (tpl[j] === '}' && --depth === 0) {
+        out.push(tpl.slice(i + 2, j).trim());
+        i = j;
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Interpolations that can't carry user text: numbers, constants, placeholder lists ($1, $2…)
+ * and identifiers defined in the same file as literals or placeholder builders.
+ */
+function safeInterpolation(expr, defs, depth = 0) {
+  if (/^(?:Number|parseInt|parseFloat|Math\.\w+)\s*\(|^\d+$|^[A-Z][A-Z0-9_]*(?:\.[A-Z][A-Z0-9_]*)*$/.test(expr)) return true;
+  if (/\$\$\{|['"`]\$['"`]\s*\+|placeholder/i.test(expr)) return true;
+  if (/^[A-Za-z_$][\w$]*$/.test(expr) && defs.has(expr) && depth < 2) {
+    const rhs = defs.get(expr).rhs.trim();
+    if (literalValue(rhs) !== null || /^\d+$/.test(rhs) || /\$\$\{|['"`]\$['"`]\s*\+/.test(rhs)) return true;
+    if (rhs.startsWith('`')) return interpolations(rhs).every((e) => safeInterpolation(e, defs, depth + 1));
+    if (/^\w+\s*\?\s*(['"`])[^'"`]*\1\s*:\s*(['"`])[^'"`]*\2$/.test(rhs)) return true; // asc ? 'ASC' : 'DESC'
+  }
+  return false;
 }
 
 // ── APP-03 ─────────────────────────────────────────────────────────────────
@@ -3096,6 +3392,9 @@ function nosqli({ repo, server, tainted }) {
 
 const FETCH_RE = /(?<![\w.$])(?:fetch|axios(?:\.(?:get|post|put|patch|delete|head|request))?|got(?:\.(?:get|post|stream))?|ky(?:\.(?:get|post))?|needle|superagent\.(?:get|post)|request(?:\.(?:get|post))?|https?\.(?:get|request)|undici\.request|\$fetch|ofetch)\s*\(/g;
 
+// A host allowlist or URL validator ahead of the request.
+const SSRF_GUARD_RE = /\b(?:is|validate|check|assert|ensure|verify)\w*(?:Url|URL|Uri|URI|Host|Hostname|Domain|Allowed|Safe|Origin|Ssrf|SSRF)\w*\s*\(|\b(?:allow|white|safe)[_-]?list\w*\.(?:includes|has|some)\(|\b(?:ALLOWED|allowed)\w*\.(?:includes|has|some)\(|\.(?:hostname|host|origin)\s*(?:!==|===|!=|==)|ssrf-req-filter|request-filtering-agent|\bipaddr\.|\bisPrivate(?:IP|Ip|Address)?\s*\(/;
+
 function ssrf({ repo, server, tainted }) {
   const c = collector(repo);
   for (const f of server) {
@@ -3113,7 +3412,10 @@ function ssrf({ repo, server, tainted }) {
         if (/^[a-z][a-z0-9+.-]*:\/\/[^/$]+\//i.test(prefix) || /^\//.test(prefix)) continue; // host pinned (or relative)
       }
       if (/^[A-Z_][A-Z0-9_]*\s*\+/.test(url) || /^process\.env\.\w+\s*\+/.test(url)) continue; // BASE_URL + path
-      if (isTainted(url, names)) c.add(f, m.index, `server-side request to a URL from request data (${url.slice(0, 40)})`);
+      if (/^`\$\{\s*(?:[A-Z][A-Z0-9_]*|process\.env\.\w+|(?:env|config)\.\w+)\s*\}\//.test(url)) continue; // `${BASE_URL}/path`: host pinned
+      if (!isTainted(url, names)) continue;
+      if (SSRF_GUARD_RE.test(text.slice(Math.max(0, m.index - 2000), m.index))) continue; // allowlist / URL validator before the call
+      c.add(f, m.index, `server-side request to a URL from request data (${url.slice(0, 40)})`);
     }
   }
   return result('APP-05', c.hits, 'No server-side fetches to request-controlled URLs found.');
@@ -3195,7 +3497,10 @@ function codeInjection({ repo, all, tainted }) {
       if (call && call.args[0] && literalValue(call.args[0].text) === null) c.add(f, m.index, `node:vm runs ${label(call.args[0].text)} (vm is not a security sandbox)`);
     }
     for (const m of text.matchAll(/\bset(?:Timeout|Interval)\s*\(\s*(['"`]|[A-Za-z_$][\w$]*\s*\+)/g)) c.add(f, m.index, 'setTimeout/setInterval with a string argument is eval');
-    for (const m of text.matchAll(/\b(?:require|import)\s*\(\s*(?:req|request|params|body|query)\b/g)) c.add(f, m.index, 'module loaded from request data');
+    for (const m of text.matchAll(/\b(?:require|import)\s*\(\s*([^()'"`]+?)\s*\)/g)) {
+      // require(req.query.x) / import(body.plugin): a bare `request` variable in a bundler is a module specifier
+      if (/^(?:req|request|ctx\.request)\.(?:query|params|body)\b|^(?:params|body|query)\.\w/.test(m[1]) || (names.size && isTainted(m[1], names))) c.add(f, m.index, 'module loaded from request data');
+    }
     for (const m of text.matchAll(/require\(\s*['"]vm2['"]\s*\)|from\s+['"]vm2['"]/g)) c.add(f, m.index, 'vm2 is deprecated and has known sandbox escapes');
   }
   return result('APP-09', c.hits, 'No eval, new Function, vm.run* or string timers on non-literal input found.');
@@ -3259,7 +3564,8 @@ function openRedirect({ repo, server, all, tainted }) {
   for (const f of all.filter((x) => x.kind === 'code' && repo.side(x) === 'client')) {
     const text = repo.code(f) || '';
     const names = taintedNames(text, CLIENT_SOURCE_RE);
-    for (const m of text.matchAll(/\b(?:window\.)?location(?:\.href)?\s*=\s*([^;\n]+)|\blocation\.(?:assign|replace)\(\s*([^)]+)\)/g)) {
+    // assignments only: not comparisons, arrow params, JSX props (location={…}) or declarations
+    for (const m of text.matchAll(/(?<![\w.$]|(?:const|let|var)\s+)(?:window\.|document\.)?location(?:\.href)?\s*=(?![=>{])\s*([^;\n]+)|\blocation\.(?:assign|replace)\(\s*([^)]+)\)/g)) {
       const target = (m[1] || m[2] || '').trim();
       if (!target || literalValue(target) !== null || /^['"`]\//.test(target)) continue;
       if (!isTainted(target, names, CLIENT_SOURCE_RE) || REDIRECT_GUARD_RE.test(near(text, m.index))) continue;
@@ -3291,8 +3597,8 @@ const { parseEnv, secretLabel } = require('./env');
 
 const IDS = ['SEC-01', 'SEC-03', 'SEC-04', 'SEC-05', 'SEC-06', 'SEC-07'];
 
-/** Passwords bots try first. */
-const DEFAULT_PASSWORDS = new Set(['admin', 'admin123', 'admin1234', 'administrator', 'password', 'password1', 'password123', 'passw0rd', 'p@ssw0rd', 'changeme', 'changeit', 'default', 'root', 'toor', 'letmein', 'secret', '123456', '12345678', '123456789', 'qwerty', 'test', 'test123', 'guest', 'demo', 'example', 'postgres', 'mysql', 'minioadmin', 'pass', '1234', 'welcome', 'welcome1']);
+/** Passwords bots try first (patterns.js shares them with redaction, which shows them as-is). */
+const { DEFAULT_PASSWORDS } = P;
 
 // DB password variables with a literal value: DB_PASSWORD=…, POSTGRES_PASSWORD: …
 const DB_PASS_VAR_RE = /\b((?:DB|DATABASE|PG|POSTGRES|MYSQL|MYSQL_ROOT|MARIADB|MARIADB_ROOT|MONGO|MONGODB|MONGO_INITDB_ROOT|REDIS|MSSQL|SA)_?(?:PASS(?:WORD)?|PWD))\b["']?\s*[:=]\s*["']?([^\s"'`#,;})]{4,})/gi;
@@ -3311,7 +3617,7 @@ const LIB_SECRET_RE = /\b(secret|secretOrKey|secretOrPrivateKey)\s*:\s*(['"`])([
 const IRON_PASSWORD_RE = /\bpassword\s*:\s*(['"`])([^'"`\n]{8,256})\1/g;
 const COOKIE_KEYS_RE = /\bkeys\s*:\s*\[\s*(['"`])([^'"`\n]{3,256})\1/g;
 const JOSE_LITERAL_RE = /new\s+TextEncoder\(\)\.encode\(\s*(['"`])([^'"`\n]{3,256})\1\s*\)/g;
-const CONFIG_SECRET_RE = /["']?(jwtSecret|jwt_secret|JWT_SECRET|sessionSecret|session_secret|secretKey|secret_key|tokenSecret|appSecret|cookieSecret)["']?\s*[:=]\s*["']([^"'\n]{3,256})["']/g;
+const CONFIG_SECRET_RE = /(?<![\w])["']?(jwtSecret|jwt_secret|JWT_SECRET|sessionSecret|session_secret|secretKey|secret_key|tokenSecret|appSecret|cookieSecret)["']?\s*[:=]\s*["']([^"'\n]{3,256})["']/g;
 // Docker/infra env vars that commonly ship with default passwords.
 const INFRA_DEFAULT_RE = /\b((?:POSTGRES|MYSQL|MYSQL_ROOT|MARIADB|MARIADB_ROOT|MONGO_INITDB_ROOT|RABBITMQ_DEFAULT|MINIO_ROOT|PGADMIN_DEFAULT|GF_SECURITY_ADMIN|REDIS|ADMIN|DEFAULT_ADMIN|KEYCLOAK_ADMIN|ELASTIC)_(?:PASSWORD|PASS))\b["']?\s*[:=]\s*["']?([^\s"'#,]+)/gi;
 const AI_CONTEXT_RE = /gemini|generativeai|@google\/genai|@google\/generative-ai|generativelanguage|GoogleGenerativeAI|GoogleGenAI/i;
@@ -3347,10 +3653,11 @@ function where(repo, f) {
 
 function dbCredentials(repo, claimed) {
   const hits = [];
-  const add = (f, index, note, weak = false) => {
+  const add = (f, index, note, weak = false, value = null) => {
     const line = repo.lineOf(f, index);
     if (repo.suppressed(f, line) || localOnly(repo, f)) return;
     claimed.add(`${f.rel}:${line}`);
+    repo.noteSecret(value);
     hits.push({ e: ev(f.rel, line, `${note}${where(repo, f)}`, repo.snippet(f, line)), weak });
   };
   for (const f of scanFiles(repo)) {
@@ -3360,20 +3667,22 @@ function dbCredentials(repo, claimed) {
     for (const d of P.findDbUrls(text)) {
       if (d.placeholder || /^[$%{]/.test(d.password)) continue;
       if (DEFAULT_PASSWORDS.has(d.password.toLowerCase())) continue; // SEC-07
-      if (d.local) add(f, d.index, `${d.scheme} URL with an inline password for local host "${d.host}"`, true);
-      else add(f, d.index, `${d.scheme} connection string with an inline password for ${d.host}`);
+      if (d.local) add(f, d.index, `${d.scheme} URL with an inline password for local host "${d.host}"`, true, d.password);
+      else add(f, d.index, `${d.scheme} connection string with an inline password for ${d.host}`, false, d.password);
     }
     for (const m of text.matchAll(DB_PASS_VAR_RE)) {
       const value = m[2];
       if (P.isPlaceholder(value) || /^[$%{]/.test(value) || /process\.env|import\.meta/.test(value)) continue;
       if (DEFAULT_PASSWORDS.has(value.toLowerCase())) continue; // SEC-07
-      add(f, m.index, `${m[1]} set to a literal value`);
+      // compose files, CI jobs and tests set the password of a throwaway container they start
+      const container = CONTAINER_CONFIG_RE.test(f.rel) || repo.isTest(f);
+      add(f, m.index, `${m[1]} set to a literal value${container ? ' for a container this file starts' : ''}`, container, value);
     }
     for (const m of text.matchAll(DB_CLIENT_RE)) {
       const windowText = text.slice(m.index, m.index + 800);
       const pm = /\bpassword\s*:\s*(['"`])([^'"`\n]{4,})\1/.exec(windowText);
       if (!pm || P.isPlaceholder(pm[2]) || pm[2].includes('${')) continue;
-      add(f, m.index + pm.index, 'literal password in a database client config');
+      add(f, m.index + pm.index, 'literal password in a database client config', false, pm[2]);
     }
   }
   const strong = hits.filter((h) => !h.weak);
@@ -3381,6 +3690,9 @@ function dbCredentials(repo, claimed) {
   if (hits.length) return warn('SEC-01', hits.map((h) => h.e), { question: 'These credentials point at local hosts. Are they dev-only, and is the same password used anywhere reachable?' });
   return pass('SEC-01', ['No database connection strings or DB passwords with literal values found in source or config.']);
 }
+
+const CONTAINER_CONFIG_RE = /(?:^|\/)(?:docker-)?compose[\w.-]*\.ya?ml$|(?:^|\/)\.github\/|(?:^|\/)\.circleci\/|(?:^|\/)\.gitlab-ci\.ya?ml$|(?:^|\/)bitbucket-pipelines\.ya?ml$/;
+const SAMPLE_FILE_RE = /(?:^|\/)(?:docs?|seeds?|seeders?)\/|(?:^|\/)seed[\w-]*\.[cm]?[jt]s$|(?:^|\/)(?:openapi|swagger)[\w.-]*\.(?:json|ya?ml)$/i;
 
 // ── SEC-03 ─────────────────────────────────────────────────────────────────
 
@@ -3401,7 +3713,8 @@ function hardcodedSecrets(repo, claimed) {
       if (s.google && !aiFile) continue; // Firebase/Maps browser keys are public by design
       const line = repo.lineOf(f, s.index);
       if (repo.suppressed(f, line) || localOnly(repo, f)) continue;
-      add(f, line, s.google ? 'Google AI (Gemini) API key' : s.label, Boolean(s.lowImpact));
+      repo.noteSecret(s.value);
+      add(f, line, s.google ? 'Google AI (Gemini) API key' : s.label, Boolean(s.lowImpact) || repo.isTest(f));
     }
     if (f.kind === 'doc' || f.rel.endsWith('.d.ts') || repo.isMinified(f) || /(?:^|\/)(?:locales?|i18n|lang|translations|messages)\//.test(f.rel)) continue;
     for (const m of text.matchAll(P.GENERIC_ASSIGN_RE)) {
@@ -3409,16 +3722,22 @@ function hardcodedSecrets(repo, claimed) {
       const value = m[3];
       const line = repo.lineOf(f, m.index);
       if (claimed.has(`${f.rel}:${line}`)) continue;
+      if (repo.isTest(f) || SAMPLE_FILE_RE.test(f.rel)) continue; // tests, seeds, docs and API specs hold sample credentials; only provider-format keys count there
+      if (/\bexamples?\s*[:=(]|@Api(?:Property|Response|Body)\b|@example\b/.test(text.slice(Math.max(0, m.index - 300), m.index))) continue; // documented example values
       if (P.PUBLIC_NAME_RE.test(name) || P.PUBLIC_VALUE_RE.test(value)) continue;
       if (P.isPlaceholder(value) || !P.looksSecret(value) || DEFAULT_PASSWORDS.has(value.toLowerCase())) continue;
+      // header/cookie/storage key names ('x-api-key', 'session_token') and values echoing the name
+      const norm = (x) => x.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (/^[a-z]+(?:[_-][a-z]+)+$/.test(value) || value.includes('${') || norm(name).endsWith(norm(value))) continue;
       if (P.findSecrets(value).length || P.findDbUrls(value).length) continue; // reported by the strong rules
       if (/^eyJ/.test(value) && P.supabaseRole(value) === 'anon') continue;
       if (isCommentLine(repo.lineText(f, line)) || repo.suppressed(f, line) || localOnly(repo, f)) continue;
-      add(f, line, `hardcoded value for "${name}"`, false);
+      repo.noteSecret(value);
+      add(f, line, `hardcoded value for "${name}"`, CONTAINER_CONFIG_RE.test(f.rel)); // CI/compose values configure throwaway test runs
     }
   }
   if (hits.some((h) => !h.weak)) return fail('SEC-03', hits.map((h) => h.e));
-  if (hits.length) return warn('SEC-03', hits.map((h) => h.e), { question: 'Only test-mode keys were found. Are they really test keys, and are live keys kept out of the repo?' });
+  if (hits.length) return warn('SEC-03', hits.map((h) => h.e), { question: 'Only test-mode or local-dev keys, values in tests, or values in CI/compose files were found. Are they all throwaway values, and are real keys kept out of the repo?' });
   return pass('SEC-03', ['No high-confidence secret formats or hardcoded credential assignments found outside .env files and build output.']);
 }
 
@@ -3524,9 +3843,10 @@ function historyFindings(repo, opts) {
     const depth = opts.historyDepth || 200;
     const found = new Map(); // value|file -> hit (oldest occurrence wins: log is newest-first)
     const { commits, truncated, error } = await streamGitLog(repo.root, depth, (a) => {
+      if (!P.SECRET_HINT_RE.test(a.text) || repo.userIgnored(a.file)) return; // most added lines can't hold a known secret format
       for (const s of P.findSecrets(a.text)) {
         if (s.google && !AI_CONTEXT_RE.test(a.text)) continue;
-        found.set(`${s.value}|${a.file}`, { ...a, label: s.google ? 'Google AI API key' : s.label, value: s.value, lowImpact: s.lowImpact, ai: s.ai || (s.google ? 'Google AI' : null) });
+        found.set(`${s.value}|${a.file}`, { ...a, label: s.google ? 'Google AI API key' : s.label, value: s.value, lowImpact: s.lowImpact || repo.isTest({ rel: a.file }), ai: s.ai || (s.google ? 'Google AI' : null) });
       }
       for (const d of P.findDbUrls(a.text)) {
         if (d.placeholder || d.local || /^[$%{]/.test(d.password)) continue;
@@ -3542,7 +3862,7 @@ function historyFindings(repo, opts) {
         if (line.startsWith('\0')) header = line.slice(1).trim();
         else if (line.trim()) {
           const base = path.posix.basename(line.trim());
-          if (!ENV_FILE_RE.test(base) || /(?:example|sample|template|dist|defaults|schema)/i.test(base)) continue;
+          if (!ENV_FILE_RE.test(base) || /(?:example|sample|template|dist|defaults|schema)/i.test(base) || repo.userIgnored(line.trim())) continue;
           // Only env files that held secret-looking values count (public config like NEXT_PUBLIC_* is fine).
           const sha = header.split(' ')[0];
           const content = repo.git.run(['cat-file', 'blob', `${sha}:./${line.trim()}`]) || ''; // cat-file never runs textconv/filters
@@ -3551,7 +3871,8 @@ function historyFindings(repo, opts) {
         }
       }
     }
-    return { commits, truncated, found, envAdds };
+    const shallow = (repo.git.run(['rev-parse', '--is-shallow-repository']) || '').trim() === 'true';
+    return { commits, truncated, found, envAdds, shallow };
   })();
   return repo._history;
 }
@@ -3570,11 +3891,12 @@ async function gitHistory(repo, opts) {
   const evidence = [...h.found.values()].map((x) => historyEvidence(repo, x));
   for (const a of h.envAdds) evidence.push(ev(a.file, null, `env file with ${a.count} secret-looking value${a.count > 1 ? 's' : ''} committed in ${a.header}; every value in it is readable in history`));
   if (h.truncated) evidence.push(`History scan stopped early (time/size budget); scanned ${h.commits} commits.`);
+  if (h.shallow) evidence.push('Shallow clone: commits older than the clone depth are not available here and were not scanned. Re-run on a full clone (git fetch --unshallow) for a complete history scan.');
   if (h.found.size || h.envAdds.length) {
-    if ([...h.found.values()].every((x) => x.lowImpact) && !h.envAdds.length) return warn('SEC-04', evidence, { question: 'Only test-mode keys were found in history. Confirm they are test keys.' });
+    if ([...h.found.values()].every((x) => x.lowImpact) && !h.envAdds.length) return warn('SEC-04', evidence, { question: 'Only test-mode or local-dev keys, or keys in test files, were found in history. Confirm none of them was ever a real key.' });
     return fail('SEC-04', evidence);
   }
-  return pass('SEC-04', [`Scanned the last ${h.commits} commit(s) touching this directory: no high-confidence secrets in added lines and no committed env files.${h.truncated ? ' (stopped early on the time/size budget)' : ''}`]);
+  return pass('SEC-04', [`Scanned the last ${h.commits} commit(s) touching this directory: no high-confidence secrets in added lines and no committed env files.${h.truncated ? ' (stopped early on the time/size budget)' : ''}`, ...evidence.filter((e) => e.startsWith('Shallow clone'))]);
 }
 
 // ── SEC-05 ─────────────────────────────────────────────────────────────────
@@ -3618,14 +3940,15 @@ function bundleSecrets(repo) {
 function jwtSecrets(repo, claimed) {
   const hits = [];
   const seen = new Set();
-  const add = (f, index, note) => {
+  const add = (f, index, note, value = null) => {
     const line = repo.lineOf(f, index);
+    repo.noteSecret(value);
     if (repo.suppressed(f, line) || seen.has(`${f.rel}:${line}`)) return;
     seen.add(`${f.rel}:${line}`);
     claimed.add(`${f.rel}:${line}`);
     hits.push(ev(f.rel, line, note, repo.snippet(f, line)));
   };
-  const bad = (v) => !/^\$\{|process\.env|import\.meta|Deno\.env/.test(v) && !v.includes('${');
+  const bad = (v) => !/^\$\{|^env\(|process\.env|import\.meta|Deno\.env/.test(v) && !v.includes('${');
   const files = repo.files.filter((f) => !f.build && (f.kind === 'code' || f.kind === 'config') && !repo.isTest(f) && !localOnly(repo, f));
   for (const f of files) {
     const text = repo.code(f);
@@ -3634,27 +3957,27 @@ function jwtSecrets(repo, claimed) {
       const literalDefs = new Map();
       for (const m of text.matchAll(SECRET_CONST_RE)) {
         literalDefs.set(m[1], { index: m.index, value: m[3] });
-        if (SECRET_CONST_NAME_RE.test(m[1]) && bad(m[3])) add(f, m.index, `signing secret "${m[1]}" is a string literal`);
+        if (SECRET_CONST_NAME_RE.test(m[1]) && bad(m[3])) add(f, m.index, `signing secret "${m[1]}" is a string literal`, m[3]);
       }
       for (const m of text.matchAll(JWT_CALL_RE)) {
         const call = splitArgs(text, m.index + m[0].length - 1);
         if (!call || call.args.length < 2) continue;
         const secretArg = call.args[1].text;
         const lit = literalValue(secretArg);
-        if (lit !== null && bad(lit)) add(f, call.args[1].start, `jwt.${m[1]}() uses a string literal as the secret`);
+        if (lit !== null && bad(lit)) add(f, call.args[1].start, `jwt.${m[1]}() uses a string literal as the secret`, lit);
         else if (/^[A-Za-z_$][\w$]*$/.test(secretArg) && literalDefs.has(secretArg) && bad(literalDefs.get(secretArg).value)) {
-          add(f, literalDefs.get(secretArg).index, `jwt.${m[1]}() secret "${secretArg}" is a string literal`);
+          add(f, literalDefs.get(secretArg).index, `jwt.${m[1]}() secret "${secretArg}" is a string literal`, literalDefs.get(secretArg).value);
         }
       }
-      for (const m of text.matchAll(ENV_FALLBACK_RE)) add(f, m.index, `${m[1]} falls back to a hardcoded string when the env var is missing`);
+      for (const m of text.matchAll(ENV_FALLBACK_RE)) add(f, m.index, `${m[1]} falls back to a hardcoded string when the env var is missing`, m[3]);
       if (SESSION_LIB_RE.test(text)) {
-        for (const m of text.matchAll(LIB_SECRET_RE)) if (bad(m[3])) add(f, m.index, `session/JWT library "${m[1]}" is a string literal`);
-        if (/iron-session|getIronSession|sealData/.test(text)) for (const m of text.matchAll(IRON_PASSWORD_RE)) if (bad(m[2])) add(f, m.index, 'iron-session password is a string literal');
-        if (/cookie-session/.test(text)) for (const m of text.matchAll(COOKIE_KEYS_RE)) if (bad(m[2])) add(f, m.index, 'cookie-session signing key is a string literal');
-        if (/\bjose\b|SignJWT|jwtVerify/.test(text)) for (const m of text.matchAll(JOSE_LITERAL_RE)) if (bad(m[2])) add(f, m.index, 'jose signing key is encoded from a string literal');
+        for (const m of text.matchAll(LIB_SECRET_RE)) if (bad(m[3])) add(f, m.index, `session/JWT library "${m[1]}" is a string literal`, m[3]);
+        if (/iron-session|getIronSession|sealData/.test(text)) for (const m of text.matchAll(IRON_PASSWORD_RE)) if (bad(m[2])) add(f, m.index, 'iron-session password is a string literal', m[2]);
+        if (/cookie-session/.test(text)) for (const m of text.matchAll(COOKIE_KEYS_RE)) if (bad(m[2])) add(f, m.index, 'cookie-session signing key is a string literal', m[2]);
+        if (/\bjose\b|SignJWT|jwtVerify/.test(text)) for (const m of text.matchAll(JOSE_LITERAL_RE)) if (bad(m[2])) add(f, m.index, 'jose signing key is encoded from a string literal', m[2]);
       }
     } else if (/(?:^|\/)(?:config|settings)[^/]*\.(?:json|ya?ml|toml)$|(?:^|\/)config\//.test(f.rel)) {
-      for (const m of text.matchAll(CONFIG_SECRET_RE)) if (bad(m[2]) && !P.isPlaceholder(m[2])) add(f, m.index, `"${m[1]}" is set in a committed config file`);
+      for (const m of text.matchAll(CONFIG_SECRET_RE)) if (bad(m[2]) && !P.isPlaceholder(m[2])) add(f, m.index, `"${m[1]}" is set in a committed config file`, m[2]);
     }
   }
   if (hits.length) return fail('SEC-06', hits);
@@ -3962,7 +4285,7 @@ const CHECKS = [
     script: 'secrets.js',
     what: 'Database connection strings or DB passwords written into source or config files.',
     why: 'Whoever reads the repo can connect straight to your database, skipping your app, your auth and RLS. GitHub found 39M leaked secrets in 2024, and bots harvest them within minutes.',
-    detect: 'Script: connection URLs with an inline password (postgres://, mysql://, mongodb(+srv)://, redis://, amqp://, mssql://…) pointing at a non-local host, DB password variables (DB_PASSWORD, POSTGRES_PASSWORD…) with literal values, and `password:` keys inside DB client constructors. Placeholders, ${VAR} templates and .env files (SEC-02) are excluded. Localhost URLs downgrade to warn.',
+    detect: 'Script: connection URLs with an inline password (postgres://, mysql://, mongodb(+srv)://, redis://, amqp://, mssql://…) pointing at a non-local host, DB password variables (DB_PASSWORD, POSTGRES_PASSWORD…) with literal values, and `password:` keys inside DB client constructors. Placeholders, ${VAR} templates and .env files (SEC-02) are excluded. Localhost URLs downgrade to warn, as do passwords for containers that compose files, CI jobs or tests start themselves.',
     fix: 'Rotate the database password now (Supabase: Project Settings → Database → Reset database password). Then read the connection string from an environment variable (process.env.DATABASE_URL) that you set in your host\'s encrypted env settings, and delete the literal from source. The old password stays public in git history (SEC-04), so rotating is the real fix.',
     question: 'Is this a real credential for a database reachable from the internet, or a local/dev placeholder?',
   },
@@ -3975,7 +4298,7 @@ const CHECKS = [
     script: 'env.js',
     what: '.env files that are tracked by git, sit inside a public web root, or aren\'t covered by .gitignore.',
     why: 'A committed .env hands every secret to anyone with repo access. A .env under public/ is served at https://yoursite/.env, a path scanners request constantly.',
-    detect: 'Script: lists every .env* file (plus .dev.vars and .envrc) and checks three things: tracked (`git ls-files`), ignored (`git check-ignore`), and whether it sits under public/, static/, dist/, build/, out/ or another web root. Example files (.env.example, .env.sample, .env.template) are flagged only when they hold real-looking secrets. A committed .env with no secret-looking values is a warn.',
+    detect: 'Script: lists every .env* file (plus .dev.vars and .envrc) and checks three things: tracked (`git ls-files`), ignored (`git check-ignore`), and whether it sits under public/, static/, dist/, build/, out/ or another web root. Example files (.env.example, .env.sample, .env.template) fail only when they hold a provider-format secret or a real DB URL, and warn when a secret-named value looks randomly generated. A committed .env with no secret-looking values is a warn.',
     fix: 'Run `git rm --cached .env` (your local copy stays), add `.env*` and `!.env.example` to .gitignore, and commit. Then rotate every secret the file held, because it\'s already in history. Never keep env files under public/ or any folder your host serves. Set production secrets in the hosting dashboard instead.',
     question: 'Does this env file hold real secrets, and has every one of them been rotated?',
   },
@@ -3988,7 +4311,7 @@ const CHECKS = [
     script: 'secrets.js',
     what: 'API keys, tokens and private keys pasted directly into source or config files.',
     why: 'Anything in the repo becomes public once it\'s shared, deployed or open-sourced. Leaked Stripe, AWS and OpenAI keys get used for fraud and free compute within minutes.',
-    detect: 'Script: provider key formats (AWS AKIA…, Stripe sk_live_/rk_live_, GitHub ghp_/github_pat_, OpenAI sk-/sk-proj-, Anthropic sk-ant-, Slack, SendGrid, Twilio SK…, npm, Supabase sb_secret_ and service_role JWTs, PEM private keys…), plus generic `api_key/secret/token/password = "<literal>"` assignments with secret-like values. Covers the working tree except build output and .env files. If the only hits are Stripe test keys, the result is a warn.',
+    detect: 'Script: provider key formats (AWS AKIA…, Stripe sk_live_/rk_live_, GitHub ghp_/github_pat_, OpenAI sk-/sk-proj-, Anthropic sk-ant-, Slack, SendGrid, Twilio SK…, npm, Supabase sb_secret_ and service_role JWTs, PEM private keys…), plus generic `api_key/secret/token/password = "<literal>"` assignments with secret-like values. Covers the working tree except build output and .env files. Generic assignments are skipped in tests, seed scripts, docs and API specs (sample credentials), and documented `example:` values are ignored; provider formats still count there, as a warn when they sit in tests. If the only hits are test-mode or local-dev keys, keys in tests, or literal values in CI/compose files, the result is a warn.',
     fix: 'Revoke and reissue each key in the provider\'s dashboard first. Deleting it from code doesn\'t un-leak it. Then load it from an environment variable in server-only code. Add a pre-commit secret scanner (gitleaks) or turn on GitHub push protection so it can\'t happen again.',
     question: 'Is this value a live credential? If it is only a test or sample value, say so explicitly.',
   },
@@ -4001,7 +4324,7 @@ const CHECKS = [
     script: 'secrets.js',
     what: 'Secrets committed at any point in the last 200 commits (by default), even if they were deleted later.',
     why: 'Deleting a key in a later commit doesn\'t remove it. Anyone who clones the repo can run `git log -p` and read it, and public repos are scraped around the clock.',
-    detect: 'Script: streams `git log -p` for the last 200 commits, limited to the scanned directory, and runs the high-confidence secret patterns over added lines. It also lists .env files that were ever committed. Each hit says whether the secret is still in the working tree.',
+    detect: 'Script: streams `git log -p` for the last 200 commits, limited to the scanned directory, and runs the high-confidence secret patterns over added lines. It also lists .env files that were ever committed with secret-looking values. Each hit says whether the secret is still in the working tree; hits that are only test-mode keys or sit in test files warn. Shallow clones are called out, since their older history can\'t be scanned.',
     fix: 'Rotate every listed secret. That is the real fix. You can also purge history with `git filter-repo --invert-paths --path .env` (or BFG), force-push, and have collaborators re-clone. GitHub caches and forks may still hold the old commits, so never skip rotation.',
     question: 'Has each of these secrets been rotated since it was committed?',
   },
@@ -4081,7 +4404,7 @@ const CHECKS = [
     script: 'auth.js',
     what: 'API routes that change state or return user data with no visible authentication or authorization check.',
     why: 'An API route without an auth check is public. Anyone can call it with curl, no UI needed.',
-    detect: 'Script: enumerates Express/Fastify/Hono/Koa routes, Next.js route handlers and pages/api, server actions, SvelteKit/Remix actions, and Netlify/Vercel/Supabase/Firebase functions. It flags POST/PUT/PATCH/DELETE handlers (and GETs on sensitive paths) with no auth primitive in the handler, its middleware chain, the router mount or middleware.ts. Login, signup, webhook and health routes are excluded. The agent confirms each one.',
+    detect: 'Script: enumerates Express/Fastify/Hono/Koa routes, Next.js route handlers and pages/api, server actions, SvelteKit/Remix actions, and Netlify/Vercel/Supabase/Firebase functions. It flags POST/PUT/PATCH/DELETE handlers (and GETs on sensitive paths) with no auth primitive in the handler, a helper or wrapper it calls (one hop, through imports and @/ or workspace aliases), its middleware chain, the router mount, or middleware.ts/proxy.ts. Login, signup, webhook and health routes (and server actions named for them) are excluded. The agent confirms each one.',
     fix: 'Put auth in one place: a middleware applied to the whole /api router (or Next.js middleware plus a server-side session check in each handler). Deny by default and explicitly allowlist the few public routes. Inside handlers, take the user from the verified session, never from a userId in the request body.',
     question: 'Should each of these routes require a signed-in user? If they are protected, which middleware or check does it (the scanner could not see one)?',
   },
@@ -4094,7 +4417,7 @@ const CHECKS = [
     script: 'auth.js',
     what: 'Server-side queries that return whole collections without filtering by the signed-in user.',
     why: 'A "list my orders" endpoint that runs `select * from orders` returns everyone\'s orders. Most vibe-coded data leaks start this way.',
-    detect: 'Script: in server code, Supabase `.from(x).select()` chains without an owner filter, Prisma `findMany()` without a user-scoped `where`, Mongo `find({})`, and `SELECT … FROM` with no user predicate, on tables that look user-owned.',
+    detect: 'Script: in route handlers (not shared helpers they call), Supabase `.from(x).select()` chains without an owner filter, Prisma `findMany()` without a user-scoped `where`, Mongo `find({})`, and `SELECT … FROM` with no user predicate, on tables that look user-owned. Cron/job and admin routes are skipped: listing everything is their job, and AUTH-04 covers who can reach admin routes.',
     fix: 'Scope every query to the authenticated user (`.eq(\'user_id\', user.id)`, `where: { userId: session.user.id }`) and back it with RLS (`using (auth.uid() = user_id)`) so a forgotten filter fails closed. Don\'t use the service-role key for user-facing reads.',
     question: 'Can this query return rows that belong to other users? If RLS does not apply here (service role or a direct DB connection), what filters it?',
   },
@@ -4107,7 +4430,7 @@ const CHECKS = [
     script: 'auth.js',
     what: 'Admin, internal or staff server routes with no authentication or role check, or admin pages gated only in the browser.',
     why: 'Admin endpoints delete users, issue refunds and export data. Hiding the button doesn\'t protect the endpoint.',
-    detect: 'Script: server routes whose path or router file mentions admin/internal/staff/backoffice. Fail when no auth primitive exists anywhere in the chain (handler, router mount, middleware.ts). Warn when there is auth but no role check, and for admin pages that only redirect client-side.',
+    detect: 'Script: server routes whose path or router file mentions admin/internal/staff/backoffice. Fail when no auth primitive exists anywhere in the chain (handler, router mount, middleware.ts). Warn when there is auth but no role check, and for admin pages (route files under an admin segment, not components or emails) with no server-side guard in the page, its layouts or server load files, or a helper they call, which includes pages that only redirect client-side.',
     fix: 'Enforce role checks on the server for every admin route: a `requireAdmin` middleware that reads the role from the verified session or app_metadata, never from the request. Keep admin APIs under one router with that middleware mounted first, and log admin actions.',
     question: 'Who can call this admin route today? Show the server-side check that limits it to admins, or confirm it is missing.',
   },
@@ -4133,7 +4456,7 @@ const CHECKS = [
     script: 'auth.js',
     what: 'Tokens that never expire, JWTs decoded without verification, "none" algorithms, or auth tokens kept in localStorage.',
     why: 'A stolen token that never expires is permanent account access, and jwt.decode() accepts any forged token.',
-    detect: 'Script: jwt.decode without jwt.verify, algorithm "none" or ignoreExpiration: true (fail); jwt.sign without expiresIn or with lifetimes over 30 days, tokens written to localStorage, and express-session on the default MemoryStore (warn).',
+    detect: 'Script: jwt.decode without jwt.verify, algorithm "none" or ignoreExpiration: true (fail); jwt.sign without expiresIn (payloads and options defined elsewhere in the file are followed) or with lifetimes over 30 days, tokens written to localStorage, and express-session on the default MemoryStore (warn).',
     fix: 'Verify every token with an explicit algorithms allowlist. Issue short-lived access tokens (an hour or less) with rotating refresh tokens. Keep session tokens in httpOnly cookies rather than localStorage, use a persistent session store, and invalidate sessions on logout and password change.',
     question: 'How long does a stolen token or session stay valid, and is every token signature-verified?',
   },
@@ -4185,7 +4508,7 @@ const CHECKS = [
     script: 'auth.js',
     what: 'Session or auth cookies set without HttpOnly, Secure and SameSite.',
     why: 'Without HttpOnly, any XSS can read the session cookie. Without Secure, it leaks over HTTP. Without SameSite, it rides along on cross-site requests (CSRF).',
-    detect: 'Script: res.cookie, cookies().set, setCookie and cookie.serialize calls, plus express-session/cookie-session options, that are missing httpOnly, secure or sameSite (or set them to false); document.cookie writes of tokens; and, with --url, the Set-Cookie headers from the live site.',
+    detect: 'Script: res.cookie, cookies().set, setCookie and cookie.serialize calls, plus express-session/cookie-session options, that are missing httpOnly, secure or sameSite (or set them to false; shorthand and computed values get the benefit of the doubt); document.cookie writes of tokens; and, with --url, the Set-Cookie headers from the live site.',
     fix: 'Set auth cookies with `{ httpOnly: true, secure: true, sameSite: \'lax\', path: \'/\', maxAge: … }` (use \'strict\' for admin apps). Never set auth tokens from browser JavaScript.',
     question: 'Does this cookie carry a session or auth token? If so, why is it missing HttpOnly/Secure/SameSite?',
   },
@@ -4226,7 +4549,7 @@ const CHECKS = [
     script: 'data.js',
     what: 'Rules or policies that grant everyone access: Firestore/Storage `allow read, write: if true`, test-mode date rules, RTDB `".read": true`, Supabase `using (true)` on writes, grants to anon, public buckets.',
     why: 'Open rules are the same as no auth. In 2025 the Tea app leaked about 72,000 images, including 13,000 ID photos, from an unsecured Firebase storage bucket.',
-    detect: 'Script: parses firestore.rules, storage.rules, database.rules.json, SQL policies, docker-compose files and Terraform. Always-true rules, test-mode expiry rules, write policies with `using (true)`, Postgres trust auth and publicly accessible DB instances fail. `using (true)` SELECT policies, public storage buckets, security-definer views and functions, and publicly bound DB ports warn.',
+    detect: 'Script: parses firestore.rules, storage.rules, database.rules.json, SQL policies, docker-compose files and Terraform. Always-true rules, test-mode expiry rules, write policies with `using (true)`, Postgres trust auth on a port published to all interfaces, and publicly accessible DB instances fail. `using (true)` SELECT policies, public storage buckets and publicly bound DB ports warn, as do (in Supabase projects, where the API exposes the schema) views without security_invoker and SECURITY DEFINER functions without a fixed search_path.',
     fix: 'Write rules that check identity and ownership (`allow read, write: if request.auth != null && request.auth.uid == resource.data.userId;`, `using (auth.uid() = user_id)`). Keep buckets private and serve files through signed URLs. Test your rules with the Firebase emulator or Supabase\'s policy tools before launch.',
     question: 'Is this access intentionally public (e.g. published blog posts)? If not, what ownership condition should the rule enforce?',
   },
@@ -4360,7 +4683,7 @@ const CHECKS = [
     script: 'injection.js',
     what: 'Dynamic HTML inserted without sanitization: dangerouslySetInnerHTML, innerHTML/outerHTML, insertAdjacentHTML, document.write, v-html, {@html}, unescaped template tags.',
     why: 'Stored XSS runs attacker JavaScript in every viewer\'s browser. It can steal sessions and API keys from localStorage, or make requests as the victim.',
-    detect: 'Script: the sinks above with a non-literal value and no DOMPurify/sanitize-html/xss call on the same expression; reflected `res.send` templates that include request data; EJS `<%-`, Handlebars `{{{ }}}` and Pug `!=`. Every hit is a warn the agent verifies.',
+    detect: 'Script: the sinks above with a non-literal value and no DOMPurify/sanitize-html/xss call or sanitize*/escape* helper on the same expression (values named as already sanitized, like safeHtml, and templates that only interpolate constants are skipped); reflected `res.send` templates that include request data; EJS `<%-`, Handlebars `{{{ }}}` and Pug `!=`. Every hit is a warn the agent verifies.',
     fix: 'Render text, not HTML (React escapes `{value}` by default). When you must render HTML, sanitize it with DOMPurify (`DOMPurify.sanitize(html)`) right at the sink, use textContent instead of innerHTML, and add a Content-Security-Policy (APP-15) as a second line of defense.',
     question: 'Can any part of this HTML come from a user (directly or via the database)? If so, where is it sanitized?',
   },
@@ -4412,7 +4735,7 @@ const CHECKS = [
     script: 'injection.js',
     what: 'Server-side fetches to URLs that come from the request.',
     why: 'SSRF makes your server call internal services and cloud metadata endpoints (169.254.169.254) to steal credentials, or attack other sites on an attacker\'s behalf.',
-    detect: 'Script: server-side fetch/axios/got/http.get/request calls whose URL is request data (or a variable assigned from it) and whose host isn\'t pinned by a literal prefix.',
+    detect: 'Script: server-side fetch/axios/got/http.get/request calls whose URL is request data (or a variable assigned from it), whose host isn\'t pinned by a literal or constant prefix, and that no allowlist or URL validator runs before.',
     fix: 'Allowlist the hosts you intend to call and compare `new URL(input).hostname` against the list. Block private and link-local IP ranges after DNS resolution, disable redirects (or re-validate every hop), and set short timeouts.',
     question: 'Can a user choose the host this request goes to?',
   },
@@ -4503,7 +4826,7 @@ const CHECKS = [
     script: 'comms.js',
     what: 'Webhook endpoints (Stripe, Twilio, Clerk/Svix, GitHub, Shopify, Paddle, Lemon Squeezy…) that don\'t verify the provider\'s signature.',
     why: 'Without a signature check, anyone can POST a fake "payment succeeded" event and unlock paid features or orders for free.',
-    detect: 'Script: route or handler files that look like webhook receivers (the path or file mentions "webhook", or provider signature headers are read) with no verification primitive (stripe.webhooks.constructEvent, twilio.validateRequest, svix/standardwebhooks verify, HMAC with timingSafeEqual…) in the same file.',
+    detect: 'Script: POST routes that look like webhook receivers (the path, route file or handler file mentions "webhook") and read the request, with no verification primitive (stripe.webhooks.constructEvent, twilio.validateRequest, svix/standardwebhooks verify, an HMAC compared by hand, a shared-secret header check…) in the route, its handler or the module it re-exports (fail). A handler that only passes the request to another function warns. Signed-in endpoints (managing webhook settings), tRPC routes and server actions are not receivers.',
     fix: 'Verify every webhook with the provider SDK before trusting it, e.g. `stripe.webhooks.constructEvent(rawBody, req.headers[\'stripe-signature\'], process.env.STRIPE_WEBHOOK_SECRET)` on the raw body. Reject on failure, and make handlers idempotent on the event id.',
     question: 'Is the signature verified somewhere this scanner could not see (e.g. a shared middleware)?',
   },
@@ -4568,7 +4891,7 @@ const CHECKS = [
     script: 'appsec.js',
     what: 'Error handlers that send stack traces or whole error objects to clients, or Express apps not running with NODE_ENV=production.',
     why: 'Stack traces reveal file paths, library versions, SQL and sometimes secrets: a map for the next attack.',
-    detect: 'Script: responses that include err.stack or a raw error object, and self-hosted Express apps (Dockerfile, Procfile, fly.toml, render.yaml) where NODE_ENV=production is never set, so Express prints stack traces.',
+    detect: 'Script: responses that include err.stack or a raw error object (development-only branches and logger calls excluded), and self-hosted Express apps (Dockerfile, Procfile, fly.toml, render.yaml) where NODE_ENV=production is never set, so Express prints stack traces.',
     fix: 'Log the full error server-side (Sentry or your logs) and return a generic message with a request id (`res.status(500).json({ error: \'Internal error\', id })`). Set NODE_ENV=production on every self-hosted deployment.',
     question: 'What exactly does a client receive when this handler throws in production?',
   },
@@ -4581,7 +4904,7 @@ const CHECKS = [
     script: 'appsec.js',
     what: 'Log files committed or served publicly, and logging of passwords, tokens or whole request bodies.',
     why: 'Logs are where secrets go to be forgotten. Committed or public logs leak tokens and PII, and log pipelines are a common breach source.',
-    detect: 'Script: *.log files and logs/ folders that git tracks or that sit in a public web root (fail), static serving of log folders, and console/logger calls that print password, token, secret or authorization values, or the whole req.body/req.headers, in auth or payment code (warn).',
+    detect: 'Script: *.log files and logs/ folders that git tracks or that sit in a public web root (fail), static serving of log folders, and console/logger calls that print password, token, secret or authorization values, or the whole req.body/req.headers, in auth or payment code (warn). Presence checks such as `!!token` or `secret.length` don\'t count.',
     fix: 'Add `*.log` and `logs/` to .gitignore and `git rm --cached` them, and never serve log folders. Redact secrets when logging (pino\'s redact option), or log explicit safe fields instead of whole bodies.',
     question: 'Do these logs contain tokens, passwords or personal data, and who can read them?',
   },
@@ -4622,7 +4945,7 @@ const CHECKS = [
     script: 'a11y.js',
     what: 'A static count of basic accessibility signals: ARIA labels and roles, h1 headings, image alt text, accessible names on buttons and links, keyboard support for clickable elements, html lang, and zoom.',
     why: 'More than 4,000 ADA digital-accessibility lawsuits were filed in the US in 2024 (UsableNet), mostly against small businesses. Missing alt text and unlabeled buttons are the usual exhibits.',
-    detect: 'Script: counts aria-label/aria-labelledby, role=, <h1>, <img>/<Image> without alt, icon-only buttons and links without names, onClick on div/span without role, tabIndex and a key handler, inputs without labels, <html> without lang, and disabled zoom. Near-zero ARIA, or any of those issues, = warn.',
+    detect: 'Script: counts aria-label/aria-labelledby, role=, <h1>, <img>/<Image> without alt, icon-only buttons and links without names, onClick on div/span without role, tabIndex and a key handler, inputs without labels, <html> without lang, and disabled zoom. Vendored or generated HTML (public/ subfolders, docs, coverage) is skipped, and at most five issues per file are listed. Near-zero ARIA, or any of those issues, = warn.',
     fix: 'Give every image an alt (alt="" for decorative ones) and every icon button an aria-label. Use real <button>/<a> elements instead of clickable divs, label every input, add one h1 per page and lang on <html>. Then run axe DevTools or Lighthouse and do a keyboard-only pass before launch.',
     question: 'Do these components render user-facing UI in production, and can each flagged control be reached and understood with a keyboard and screen reader?',
   },
@@ -4663,7 +4986,7 @@ const CHECKS = [
     script: 'deps.js',
     what: 'Packages with dependencies but no committed lockfile, a gitignored lockfile, or "*"/"latest" version ranges.',
     why: 'Without a lockfile every install can pull different, possibly compromised, versions. That\'s how malicious releases like the 2025 chalk/debug compromise reach production.',
-    detect: 'Script: for each package.json with dependencies, looks for package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml or bun.lock(b) in its folder or the workspace root, checks that it isn\'t gitignored, and flags "*", "latest" and "x" ranges.',
+    detect: 'Script: for each package.json with dependencies, looks for package-lock.json, npm-shrinkwrap.json, yarn.lock, pnpm-lock.yaml or bun.lock(b) in its folder or the workspace root, checks that it isn\'t gitignored, and flags "*", "latest" and "x" ranges (peerDependencies and workspace packages excepted).',
     fix: 'Commit the lockfile your package manager generates, install with `npm ci` (or `pnpm install --frozen-lockfile`) in CI and deploys, and pin wildcard ranges.',
     question: 'How are production installs pinned without a lockfile?',
   },
@@ -4676,7 +4999,7 @@ const CHECKS = [
     script: 'deps.js',
     what: 'Dependencies that are known-malicious, known-compromised versions, typosquats of popular packages, unexpected install scripts, or non-registry sources.',
     why: 'Supply-chain attacks are recent and real. In September 2025 the chalk/debug compromise hit packages with about 2 billion weekly downloads, and the Shai-Hulud worm spread to 500+ npm packages, stealing tokens on install.',
-    detect: 'Script: offline checks against a built-in list of known-malicious names and compromised versions (versions read from the lockfile), edit-distance-1 lookalikes of popular packages, install/postinstall scripts of installed direct dependencies (when node_modules exists), and git/http/tarball dependency sources. Package-age checks are skipped because they need a network call per package.',
+    detect: 'Script: offline checks against a built-in list of known-malicious names and compromised versions (versions read from the lockfile), edit-distance-1 lookalikes of popular packages (separator-only differences such as querystring/query-string excepted), install/postinstall scripts of installed direct dependencies (when node_modules exists), and git/http/tarball dependency sources. Package-age checks are skipped because they need a network call per package.',
     fix: 'Remove anything flagged as malicious and rotate the secrets on every machine that installed it. Check lookalike names against the real package\'s npm page. Install with `--ignore-scripts` (or use pnpm, which blocks dependency install scripts by default) and allowlist the few packages that need build scripts.',
     question: 'Is each flagged package the one you meant to install, and does it need its install script?',
   },
@@ -4897,7 +5220,7 @@ module.exports = { get, getOnce };
 "lib/patterns.js": function (module, exports, require) {
 'use strict';
 
-const { entropy } = require('./util');
+const { entropy, splitArgs } = require('./util');
 
 /**
  * High-confidence secret formats. Each regex keys on a provider-specific prefix and shape,
@@ -4960,6 +5283,13 @@ const SECRET_PATTERNS = [
   { id: 'private-key', label: 'Private key block', re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY(?: BLOCK)?-----/g },
 ];
 
+/**
+ * Cheap prefilter: every string any pattern above (or JWT_RE / DB_URL_RE below) can match
+ * contains one of these. Lets the history scan skip most added lines with a single test.
+ * Keep it in sync when adding patterns (test/units.test.js checks it against a sample of each).
+ */
+const SECRET_HINT_RE = /AKIA|ASIA|ABIA|ACCA|[aA][wW][sS]_?[sS][eE][cC][rR][eE][tT]|_live_|_test_|whsec_|gh[pousr]_|github_pat_|glpat-|sk-|gsk_|r8_|hf_|xai-|pplx-|AIza|xox[baprs]-|:AA|SK[0-9a-f]{32}|SG\.|key-[0-9a-f]|npm_|_authToken|shp(?:at|ca|pa|ss)_|lin_api_|dp\.(?:pt|st|sa|ct)\.|pscale_|sk\.eyJ|sb_secret_|sbp_|PRIVATE KEY|eyJ|:\/\//;
+
 /** Documentation example values that are public on purpose. */
 const KNOWN_EXAMPLES = new Set(['AKIAIOSFODNN7EXAMPLE', 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY']);
 
@@ -4975,17 +5305,24 @@ const DB_URL_RE = /\b(postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|am
 /** Hosts that only make sense on a developer machine or inside docker-compose. */
 const LOCAL_HOST_RE = /^(?:localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|::1|\[::1\]|host\.docker\.internal|db|database|postgres|postgresql|mysql|mariadb|mongo|mongodb|redis|rabbitmq|cache|[\w-]+\.local|[\w-]+\.internal|[\w.-]+\.svc(?:\.cluster\.local)?)$/i;
 
+/** Words that make an identifier a credential name (api_key, clientSecret, password, secretOrKey…). */
+const SECRET_NAME_WORDS = 'api[_-]?key|apikey|secret(?:[_-]?key|OrKey|OrPrivateKey)?|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|private[_-]?key|password|passwd|signing[_-]?key|encryption[_-]?key|webhook[_-]?secret|bearer[_-]?token';
+
 /**
  * Generic `name = "value"` / `name: "value"` assignment where the name looks like a credential.
- * Group 1 name, 2 quote, 3 value (8–256 non-space chars).
+ * Group 1 name, 2 quote, 3 value (8–256 non-space chars). The name may be the bare word
+ * (`password: '…'`). The prefix is bounded ({0,40}) so long dotted/word runs in minified code
+ * can't make this quadratic.
  */
-// The name prefix is bounded ({0,40}) so long dotted/word runs in minified code can't make this quadratic.
-const GENERIC_ASSIGN_RE = /\b([A-Za-z_$][\w$.-]{0,40}?(?:api[_-]?key|apikey|secret(?:[_-]?key)?|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|private[_-]?key|password|passwd|signing[_-]?key|encryption[_-]?key|webhook[_-]?secret|bearer[_-]?token))\b["']?\s*(?::|=|:=|=>)\s*(["'`])([^"'`\s]{8,256})\2/gi;
+const GENERIC_ASSIGN_RE = new RegExp(`\\b((?:[A-Za-z_$][\\w$.-]{0,40}?)?(?:${SECRET_NAME_WORDS}))\\b["']?\\s*(?::|=|:=|=>)\\s*(["'\`])([^"'\`\\s]{8,256})\\2`, 'gi');
+
+/** Same idea for redaction only: any quoted value after a credential-ish name, spaces allowed. */
+const REDACT_ASSIGN_RE = new RegExp(`\\b((?:[A-Za-z_$][\\w$.-]{0,40}?)?(?:${SECRET_NAME_WORDS}|secret|token|pwd))\\b["']?\\s*(?::|=|:=|=>)\\s*(["'\`])((?:(?!\\2)[^\\n\\\\]|\\\\.){3,256})\\2`, 'gi');
 
 /** Names that look secret but are public by design. */
 const PUBLIC_NAME_RE = /(public|publishable|anon|site[_-]?key|client[_-]?id|recaptcha|measurement|pk_)/i;
 
-const PLACEHOLDER_RE = /^(?:\$\{|\{\{|<|\[|%|\*+$|x{3,}|\.{3})|process\.env|import\.meta|your[_-]|example|sample|placeholder|changeme|change[_-]?me|replace|dummy|todo|xxxx|redacted|insert[_-]|enter[_-]|lorem|undefined|^null$|^none$|^true$|^false$/i;
+const PLACEHOLDER_RE = /^(?:\$\{|\{\{|<|\[|%|\*+$|x{3,}|\.{3}|env\(|\$\()|\$\{|\{\{|process\.env|import\.meta|your[_-]|example|sample|placeholder|changeme|change[_-]?me|replace|dummy|todo|xxxx|redacted|insert[_-]|enter[_-]|lorem|undefined|^null$|^none$|^true$|^false$/i;
 
 /** Values that are public tokens by format (publishable keys, anon JWTs are checked separately). */
 const PUBLIC_VALUE_RE = /^(?:pk_(?:live|test)_|pk\.eyJ|sb_publishable_|phc_|G-[A-Z0-9]{6,}$|UA-\d|AIza)/;
@@ -5046,9 +5383,16 @@ function findSecrets(text) {
     }
   }
   for (const m of text.matchAll(JWT_RE)) {
-    if (supabaseRole(m[0]) === 'service_role') {
-      hits.push({ index: m.index, value: m[0], id: 'supabase-service-role', label: 'Supabase service_role key (JWT)', supabaseSecret: true });
-    }
+    if (supabaseRole(m[0]) !== 'service_role') continue;
+    // `supabase start` ships the same public demo keys to everyone (iss: supabase-demo).
+    const demo = /supabase-demo/.test(String((decodeJwt(m[0]) || {}).iss || ''));
+    hits.push({ index: m.index, value: m[0], id: 'supabase-service-role', label: demo ? 'Supabase local-dev service_role key (the public supabase-demo key; make sure no production key replaces it here)' : 'Supabase service_role key (JWT)', supabaseSecret: !demo, lowImpact: demo });
+  }
+  // PEM headers in tests and docs are often followed by a mock body; real keys carry long base64 lines.
+  for (let i = hits.length - 1; i >= 0; i--) {
+    if (hits[i].id !== 'private-key') continue;
+    const body = text.slice(hits[i].index + hits[i].value.length, hits[i].index + hits[i].value.length + 400).replace(/\\n|\\r/g, '\n');
+    if (!/[A-Za-z0-9+/=]{48,}/.test(body)) hits.splice(i, 1);
   }
   // The generic sk-<32 hex> shape can be a substring of nothing else; keep the earliest hit per index.
   hits.sort((a, b) => a.index - b.index);
@@ -5088,9 +5432,28 @@ function mask(value) {
   return `${prefix}${rest.slice(0, 2)}…${rest.slice(-2)}`;
 }
 
+/** Mask the string-literal secret argument of jwt.sign/verify and TextEncoder().encode(). */
+function maskSigningLiterals(line) {
+  let out = line;
+  for (const m of [...line.matchAll(/\b(?:jwt|jsonwebtoken|JWT|jws)\s*\.\s*(?:sign|verify)\s*\(|\bnew\s+TextEncoder\(\)\.encode\(/g)].reverse()) {
+    const call = splitArgs(line, m.index + m[0].length - 1);
+    const arg = call && (/TextEncoder/.test(m[0]) ? call.args[0] : call.args[1]);
+    if (!arg) continue;
+    const lit = /^(['"`])([\s\S]*)\1$/.exec(arg.text);
+    if (!lit || lit[2].includes('…') || lit[2].includes('${')) continue;
+    const at = out.indexOf(arg.text, arg.start);
+    if (at !== -1) out = `${out.slice(0, at)}${lit[1]}${mask(lit[2])}${lit[1]}${out.slice(at + arg.text.length)}`;
+  }
+  return out;
+}
+
+// Well-known default passwords: flagged by SEC-07 and shown as-is, since masking them hides nothing.
+const DEFAULT_PASSWORDS = new Set(['admin', 'admin123', 'admin1234', 'administrator', 'password', 'password1', 'password123', 'passw0rd', 'p@ssw0rd', 'changeme', 'changeit', 'default', 'root', 'toor', 'letmein', 'secret', '123456', '12345678', '123456789', 'qwerty', 'test', 'test123', 'guest', 'demo', 'example', 'postgres', 'mysql', 'minioadmin', 'pass', '1234', 'welcome', 'welcome1']);
+
 /** Mask every secret-looking token in a line of source before it goes into evidence. */
 function redact(line) {
-  const masked = (v) => String(v).includes('…');
+  // already masked by an earlier rule, or a well-known default that is clearer shown as-is
+  const keep = (v) => String(v).includes('…') || DEFAULT_PASSWORDS.has(String(v).toLowerCase());
   let out = String(line);
   for (const p of SECRET_PATTERNS) {
     out = out.replace(p.re, (m, ...groups) => {
@@ -5102,12 +5465,16 @@ function redact(line) {
     });
   }
   out = out.replace(JWT_RE, (m) => mask(m));
-  out = out.replace(DB_URL_RE, (m, scheme, user, password) => (masked(password) ? m : m.replace(`:${password}@`, `:${mask(password)}@`)));
-  out = out.replace(GENERIC_ASSIGN_RE, (m, name, quote, value) => (masked(value) ? m : m.replace(value, mask(value))));
+  out = out.replace(DB_URL_RE, (m, scheme, user, password) => (keep(password) ? m : m.replace(`:${password}@`, `:${mask(password)}@`)));
+  out = maskSigningLiterals(out);
+  out = out.replace(REDACT_ASSIGN_RE, (m, name, quote, value) => (keep(value) || value.includes('${') ? m : m.replace(`${quote}${value}${quote}`, `${quote}${mask(value)}${quote}`)));
   // Quoted high-entropy blobs that don't match a known shape.
   out = out.replace(/(["'`])([A-Za-z0-9+/=_-]{24,})\1/g, (m, q, v) => (entropy(v) > 3.5 ? `${q}${mask(v)}${q}` : m));
-  // KEY=value lines (env files, shell) with secret-ish names.
-  out = out.replace(/\b([A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|TOKEN|PRIVATE|_KEY|APIKEY)[A-Z0-9_]*)\s*=\s*(["']?)([^\s"'#]{4,})\2/g, (m, name, q, v) => (masked(v) ? m : m.replace(v, mask(v))));
+  // KEY=value / KEY: value (env files, YAML, shell) with secret-ish names; skip values that are code.
+  out = out.replace(/\b([A-Za-z0-9_]*(?:SECRET|PASSWORD|PASSWD|TOKEN|PRIVATE|_KEY|APIKEY|API_KEY)[A-Za-z0-9_]*)(\s*[:=]\s*)(["']?)([^\s"'#,;]{3,})\3/gi, (m, name, sep, q, v) => {
+    if (keep(v) || /[()[\]{}]|^(?:process|import|env)\.|^\$/.test(v)) return m;
+    return `${name}${sep}${q}${mask(v)}${q}`;
+  });
   return out;
 }
 
@@ -5126,8 +5493,11 @@ const PUBLIC_PREFIXES = [
   { prefix: 'PUBLIC_', framework: 'SvelteKit/Astro', needs: ['@sveltejs/kit', 'astro'] },
 ];
 
-/** Names (after the public prefix) that mean "secret". */
-const SECRET_ENV_NAME_RE = /(SECRET|PRIVATE|PASSWORD|PASSWD|PWD\b|DATABASE_URL|DB_URL|DB_PASS|CONNECTION_STRING|ADMIN_KEY|MASTER_KEY|SIGNING|ENCRYPTION_KEY|AUTH_TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|BOT_TOKEN|API_TOKEN|SENDGRID|RESEND_API|MAILGUN|POSTMARK|TWILIO_AUTH|AWS_ACCESS|PLAID_SECRET|ALGOLIA_ADMIN|ALGOLIA_WRITE|UPSTASH_REDIS_REST_TOKEN|MONGODB_URI|MONGO_URI|REDIS_URL|SENTRY_AUTH|VERCEL_TOKEN|NETLIFY_AUTH|CLOUDFLARE_API|GITHUB_TOKEN|SLACK_TOKEN|DISCORD_TOKEN|PINECONE|SERVICE_ACCOUNT|FIREBASE_ADMIN|STRIPE_SK|SK_LIVE)/;
+/** Names (after the public prefix) that mean "secret" on their own. */
+const SECRET_ENV_NAME_RE = /(SECRET|PRIVATE|PASSWORD|PASSWD|PWD\b|DATABASE_URL|DB_URL|DB_PASS|CONNECTION_STRING|ADMIN_KEY|MASTER_KEY|SIGNING_KEY|SIGNING_SECRET|ENCRYPTION_KEY|AUTH_TOKEN|ACCESS_TOKEN|REFRESH_TOKEN|BOT_TOKEN|API_TOKEN|MONGODB_URI|MONGO_URI|REDIS_URL|SERVICE_ACCOUNT|STRIPE_SK|SK_LIVE)/;
+
+/** Provider names that only mean "secret" together with KEY/TOKEN/SECRET (SENDGRID_SENDER_NAME is fine). */
+const PROVIDER_ENV_NAME_RE = /(SENDGRID|RESEND|MAILGUN|POSTMARK|TWILIO|AWS|PLAID|ALGOLIA_ADMIN|ALGOLIA_WRITE|UPSTASH|SENTRY|VERCEL|NETLIFY|CLOUDFLARE|GITHUB|SLACK|DISCORD|PINECONE|FIREBASE_ADMIN|STRIPE|CLERK|AUTH0)/;
 
 /** Supabase service-role style names (reported by DATA-02, not SEC-08). */
 const SERVICE_ROLE_NAME_RE = /(SERVICE_?ROLE|SERVICE_?KEY|SUPABASE_SECRET|SB_SECRET)/;
@@ -5138,7 +5508,7 @@ const AI_ENV_NAME_RE = /(OPENAI|ANTHROPIC|CLAUDE|GROQ|MISTRAL|COHERE|REPLICATE|H
 const KEYISH_NAME_RE = /(KEY|TOKEN|SECRET)/;
 
 /** Public names by design (anon/publishable keys, ids, URLs). */
-const PUBLIC_ENV_OK_RE = /(ANON|PUBLISHABLE|PUBLIC_KEY|CLIENT_ID|APP_ID|PROJECT_ID|MEASUREMENT_ID|SITE_KEY|DSN|_URL$|HOST|DOMAIN|REGION|BUCKET|SENDER_ID|AUTH_DOMAIN)/;
+const PUBLIC_ENV_OK_RE = /(ANON|PUBLISHABLE|PUBLIC_KEY|CLIENT_ID|APP_ID|PROJECT_ID|MEASUREMENT_ID|SITE_?KEY|DSN|_URL$|HOST|DOMAIN|REGION|BUCKET|SENDER_ID|AUTH_DOMAIN)/;
 
 /** Names that stay secret even when they also match PUBLIC_ENV_OK_RE (e.g. DATABASE_URL). */
 const ALWAYS_SECRET_NAME_RE = /(SECRET|PRIVATE|PASSWORD|PASSWD|DATABASE_URL|DB_URL|CONNECTION_STRING|MONGODB_URI|MONGO_URI|REDIS_URL)/;
@@ -5165,17 +5535,23 @@ function classifyPublicEnv(name, value) {
     if (hit && !hit.google) return hit.ai ? 'ai' : 'secret';
     if (findDbUrls(value).some((d) => !d.placeholder)) return 'secret';
   }
+  if (value && PUBLIC_VALUE_RE.test(value)) return null;
   if (PUBLIC_ENV_OK_RE.test(upper) && !ALWAYS_SECRET_NAME_RE.test(upper)) return null;
   if (SECRET_ENV_NAME_RE.test(upper)) return 'secret';
+  // Stripe/Clerk publishable keys are also called *_KEY, so for them only TOKEN/SECRET/PASSWORD/AUTH count.
+  if (PROVIDER_ENV_NAME_RE.test(upper) && (/(TOKEN|SECRET|PASSWORD|AUTH)/.test(upper) || (/KEY/.test(upper) && !/(STRIPE|CLERK)/.test(upper)))) return 'secret';
   return null;
 }
 
 module.exports = {
+  DEFAULT_PASSWORDS,
+  SECRET_HINT_RE,
   SECRET_PATTERNS,
   JWT_RE,
   DB_URL_RE,
   LOCAL_HOST_RE,
   GENERIC_ASSIGN_RE,
+  REDACT_ASSIGN_RE,
   PUBLIC_NAME_RE,
   PUBLIC_VALUE_RE,
   PUBLIC_PREFIXES,
@@ -5215,11 +5591,14 @@ const AUTH_WORDS = [
   'supabase.auth.getUser', 'auth.getUser', 'auth.getClaims', 'getClaims(', 'verifyIdToken', 'admin.auth()', 'UseGuards', '@Authorized', 'session.user', 'req.user', 'req.auth', 'req.session.user',
   'req.session.userId', 'res.locals.user', 'ctx.state.user', 'context.user', 'locals.user', 'event.locals.user', 'request.auth', 'c.get(\'user\')', 'c.get("user")', 'getKindeServerSession',
   'withApiAuthRequired', 'getAccessToken(', 'withPageAuthRequired', 'requireApiKey', 'verifyApiKey', 'checkApiKey', 'x-api-key', 'bearerAuth', 'basicAuth', 'jwt(', 'createRemoteJWKSet',
+  'requiresAuth(', 'getCurrentUser(', 'protectedProcedure', 'authedProcedure', 'privateProcedure', 'adminProcedure', 'authedAdminProcedure', 'getServerAuthSession', 'validateRequest(',
 ];
-const AUTH_RE = new RegExp(alt(AUTH_WORDS));
+// Patterns that need word boundaries: auth() / await auth(req), session?.user, tRPC ctx.session / ctx.user.
+const AUTH_BOUNDED = String.raw`(?<![\w.$])auth\s*\(|\bsession\??\.(?:user|userId)\b|\bctx\.(?:session|user)\b`;
+const AUTH_RE = new RegExp(`${alt(AUTH_WORDS)}|${AUTH_BOUNDED}`);
 
 // Authorization by role: admin-only gates.
-const ROLE_RE = /\b(?:isAdmin|is_admin|requireAdmin|adminOnly|ensureAdmin|checkAdmin|verifyAdmin|requireRole|requireRoles|hasRole|checkRole|checkRoles|rolesGuard|RolesGuard|authorizeRoles?|requirePermission|hasPermission|checkPermission|ability\.can|isSuperAdmin|isStaff|requireStaff|adminGuard|AdminGuard)\b|\brole\s*[!=]==?\s*['"`](?:admin|owner|superuser|superadmin|staff)['"`]|['"`](?:admin|owner|superuser|superadmin|staff)['"`]\s*[!=]==?\s*[\w.?]*role\b|roles?\??\.includes\(\s*['"`](?:admin|owner|superuser|superadmin|staff)['"`]|app_metadata\??\.(?:role|roles|claims_admin)|publicMetadata\??\.role|sessionClaims|has\(\s*\{\s*(?:role|permission)\s*:|customClaims|claims\??\.admin|@Roles\(/;
+const ROLE_RE = /\b(?:adminProcedure|authedAdminProcedure|isAdmin|is_admin|requireAdmin|adminOnly|ensureAdmin|checkAdmin|verifyAdmin|requireRole|requireRoles|hasRole|checkRole|checkRoles|rolesGuard|RolesGuard|authorizeRoles?|requirePermission|hasPermission|checkPermission|ability\.can|isSuperAdmin|isStaff|requireStaff|adminGuard|AdminGuard)\b|\brole\s*[!=]==?\s*['"`](?:admin|owner|superuser|superadmin|staff)['"`]|['"`](?:admin|owner|superuser|superadmin|staff)['"`]\s*[!=]==?\s*[\w.?]*role\b|roles?\??\.includes\(\s*['"`](?:admin|owner|superuser|superadmin|staff)['"`]|app_metadata\??\.(?:role|roles|claims_admin)|publicMetadata\??\.role|sessionClaims|has\(\s*\{\s*(?:role|permission)\s*:|customClaims|claims\??\.admin|@Roles\(/;
 
 // Rate limiting libraries and platform features.
 const RATE_LIMIT_RE = /express-rate-limit|\brateLimit\s*\(|\bRateLimit\b|rate-limiter-flexible|RateLimiter(?:Memory|Redis|Postgres|Mongo|Cluster)?\b|@upstash\/ratelimit|\bRatelimit\.(?:slidingWindow|fixedWindow|tokenBucket)|express-slow-down|\bslowDown\s*\(|@fastify\/rate-limit|fastify-rate-limit|koa-ratelimit|koa2-ratelimit|hono-rate-limiter|@hono-rate-limiter|@nestjs\/throttler|ThrottlerModule|ThrottlerGuard|@arcjet\/|\barcjet\s*\(|\bcheckRateLimit\s*\(|@vercel\/firewall|\blimiter\.(?:consume|removeTokens|limit)\s*\(|\bratelimit\.limit\s*\(|@unkey\/ratelimit|next-rate-limit|\brateLimiter\b|\brate_limit\b|\bthrottle\s*\(/;
@@ -5229,10 +5608,10 @@ const VALIDATION_RE = /\.(?:parse|safeParse|parseAsync|safeParseAsync)\s*\(|\bva
 const VALIDATION_LIBS = ['zod', 'joi', '@hapi/joi', 'yup', 'valibot', 'superstruct', 'class-validator', 'express-validator', 'ajv', '@sinclair/typebox', 'celebrate', 'io-ts', 'runtypes', 'arktype', '@vinejs/vine', 'typia', '@effect/schema', 'effect', 'fastest-validator', 'validator'];
 
 // Filters that scope a query to the caller.
-const OWNER_RE = /\b(?:user_?id|userId|owner_?id|ownerId|author_?id|authorId|created_?by|createdBy|profile_?id|profileId|customer_?id|customerId|member_?id|uid)\b|auth\.uid\(\)|req\.user|session\.user|currentUser|ctx\.state\.user|locals\.user|request\.auth|res\.locals\.user|user\.id\b|userClient\(|getUser\(/;
+const OWNER_RE = /\b(?:user_?id|userId|owner_?id|ownerId|author_?id|authorId|created_?by|createdBy|profile_?id|profileId|customer_?id|customerId|member_?id|uid)\b|auth\.uid\(\)|req\.user|session\??\.user|currentUser|ctx\.state\.user|locals\.user|request\.auth|res\.locals\.user|user\.id\b|userClient\(|getUser\(/;
 
-// HTML sanitizers.
-const SANITIZER_RE = /\b(?:DOMPurify|dompurify|sanitize(?:Html)?|sanitizeHTML|purify|xss|escapeHtml|escape|insane|sanitizer|isomorphic-dompurify)\b/;
+// HTML sanitizers and escapers: libraries, plus app helpers named for it (sanitizeMarkdown(), escapeHTML(), toSafeHtml()).
+const SANITIZER_RE = /\b(?:DOMPurify|dompurify|purify|xss|filterXSS|insane|sanitizer|striptags|stripTags|strip_tags|isomorphic-dompurify)\b|\b[\w$]*(?:[sS]anitiz|[pP]urif|[eE]scape|[cC]leanHtml|[cC]leanHTML|[sS]afeHtml|[sS]afeHTML|[eE]ncodeHtml|[eE]ncodeHTML|[hH]tmlEncode|[hH]tmlEscape)[\w$]*\s*\(|\b(?:he|entities)\.(?:encode|escape)\s*\(/;
 
 module.exports = { AUTH_RE, ROLE_RE, RATE_LIMIT_RE, VALIDATION_RE, VALIDATION_LIBS, OWNER_RE, SANITIZER_RE };
 },
@@ -5249,8 +5628,8 @@ module.exports = { AUTH_RE, ROLE_RE, RATE_LIMIT_RE, VALIDATION_RE, VALIDATION_LI
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { lineStarts, lineAt, ignoreMatcher, clip, blankComments } = require('./util');
-const { redact } = require('./patterns');
+const { lineStarts, lineAt, ignoreMatcher, clip, blankComments, entropy, escapeRegExp } = require('./util');
+const { redact, mask } = require('./patterns');
 
 // Directories that never hold the app's own code: dependencies, VCS, caches, virtualenvs.
 const SKIP_DIRS = new Set([
@@ -5290,7 +5669,7 @@ const CLIENT_DIR_RE = /(?:^|\/)(?:components|hooks|contexts?|views|screens|ui|wi
 const SERVER_IMPORT_RE = /(?:require\(\s*|\bfrom\s+|\bimport\s+)['"](?:node:)?(?:fs|fs\/promises|child_process|os|net|http|https|express|fastify|koa|hono|@hono\/node-server|pg|mysql2?|mongoose|mongodb|sequelize|knex|@prisma\/client|drizzle-orm\/[\w-]+|redis|ioredis|stripe|twilio|nodemailer|@sendgrid\/mail|jsonwebtoken|bcrypt|bcryptjs|argon2|firebase-admin|firebase-admin\/[\w-]+|@supabase\/ssr|next\/server|next\/headers|server-only|@vercel\/functions|@netlify\/functions|multer|@aws-sdk\/[\w-]+)['"]|\bDeno\.(?:serve|env)\b|\bexports\.handler\s*=|\bexport\s+(?:const|async\s+function|function)\s+handler\b/;
 // Strong signs of code that runs in the browser.
 const CLIENT_SIGNAL_RE = /\b(?:window|document|localStorage|sessionStorage|navigator)\.|\buse(?:State|Effect|LayoutEffect|Ref|Reducer|Context|Navigate|Router|SearchParams|Query|Mutation)\s*\(|import\.meta\.env\.VITE_|\bonClick\s*=|\bfrom\s+['"](?:react-dom(?:\/client)?|react-router(?:-dom)?|@stripe\/stripe-js|@stripe\/react-stripe-js)['"]/;
-const TEST_PATH_RE = /(?:^|\/)(?:__tests__|__mocks__|tests?|spec|specs|e2e|cypress|playwright|fixtures?|mocks?|stories|\.storybook)\/|\.(?:test|spec|stories|e2e)\.[cm]?[jt]sx?$|(?:^|\/)test_[^/]*\.py$|_test\.(?:py|go)$/;
+const TEST_PATH_RE = /(?:^|\/)(?:__tests__|__mocks__|tests?|testing|spec|specs|e2e|cypress|playwright|fixtures?|mocks?|stories|\.storybook)\/|\.(?:test|spec|stories|e2e|e2e-spec|int-spec|integration|integration-spec|cy)\.[cm]?[jt]sx?$|(?:^|\/)test_[^/]*\.py$|_test\.(?:py|go)$/;
 // Tooling that runs on a developer machine or in CI, not in the deployed app.
 const TOOLING_PATH_RE = /(?:^|\/)(?:scripts|tools|bin|\.github|\.husky|config|migrations|seed|seeds|remix\.init|management\/commands|cli)\/|(?:^|\/)(?:cli|manage)\.(?:py|[cm]?[jt]s)$|(?:^|\/)[\w.-]+\.config\.[cm]?[jt]s$|(?:^|\/)(?:gulpfile|gruntfile|webpack|rollup|vite|next|nuxt|svelte|astro|tailwind|postcss|babel|jest|vitest|playwright|eslint|prettier)\.[\w.]*$/i;
 
@@ -5327,6 +5706,12 @@ function createRepo(root, opts) {
     git: g,
     get(rel) {
       return byRel.get(rel) || null;
+    },
+    /** Excluded by .preflightignore (checked for the path and each parent folder, like the walk). */
+    userIgnored(rel) {
+      const parts = String(rel).split('/');
+      for (let i = 1; i <= parts.length; i++) if (isIgnoredByUser(parts.slice(0, i).join('/'))) return true;
+      return false;
     },
     read(f) {
       if (typeof f === 'string') f = byRel.get(f);
@@ -5368,9 +5753,22 @@ function createRepo(root, opts) {
       const e = line < starts.length ? starts[line] - 1 : text.length;
       return text.slice(s, e);
     },
+    /**
+     * Every secret value any check has detected; snippets mask these wherever they appear as a
+     * whole token. Plain words ('prisma', 'postgres') are skipped: masking them everywhere
+     * would garble unrelated evidence, and the pattern-based redaction still covers them.
+     */
+    secrets: new Map(),
+    noteSecret(value) {
+      if (typeof value !== 'string' || value.length < 8 || repo.secrets.has(value)) return;
+      if (/^[A-Za-z]+(?:[_ -][A-Za-z]+)*$/.test(value) && !(value.length >= 20 && entropy(value) >= 3.5)) return;
+      repo.secrets.set(value, new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(value)}(?![A-Za-z0-9])`, 'g'));
+    },
     /** Redacted, clipped source line for evidence (only a bounded window is redacted, so huge minified lines stay fast). */
     snippet(f, line, max = 120) {
-      return clip(redact(repo.lineText(f, line).slice(0, 1000)), max);
+      let text = repo.lineText(f, line).slice(0, 1000);
+      for (const [v, re] of repo.secrets) if (text.includes(v)) text = text.replace(re, mask(v));
+      return clip(redact(text), max);
     },
     /** Minified/bundled-looking file: *.min.* or long average line length. Heuristics skip these. */
     isMinified(f) {
@@ -5757,13 +6155,17 @@ module.exports = { SEVERITIES, STATUSES, result, pass, fail, warn, manual, na, e
  * Server route discovery for the auth, rate-limit, validation, CSRF and webhook checks.
  *
  * Covers Express/Fastify/Hono/Koa-style routers (with cross-file mount prefixes and
- * middleware), Next.js route handlers, pages/api and server actions, SvelteKit +server and
- * form actions, Remix/React Router actions and loaders, NestJS controllers, and Netlify,
- * Vercel, Supabase and Firebase functions. Heuristic (regex + light tokenizing), never a parser.
+ * middleware, including routers mounted from arrays), Next.js route handlers, pages/api and
+ * server actions, SvelteKit +server and form actions, Remix/React Router actions and loaders,
+ * NestJS controllers, and Netlify, Vercel, Supabase and Firebase functions.
+ *
+ * Each route carries text segments to inspect: the route itself, the handler it references
+ * (possibly in another file), and one hop of helpers it calls or wraps. Heuristic (regex +
+ * light tokenizing), never a parser.
  */
 
 const path = require('path');
-const { splitArgs, literalValue } = require('./util');
+const { splitArgs, literalValue, escapeRegExp } = require('./util');
 
 const METHODS = 'get|post|put|patch|delete|del|all|options|head';
 // <name>.<method>('<path>' — the path literal must start with / or * to count as a route.
@@ -5772,13 +6174,26 @@ const ROUTE_CALL_RE = new RegExp(`\\b([A-Za-z_$][\\w$]*)\\s*\\.\\s*(${METHODS})\
 const ROUTER_CREATE_RE = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:await\s+)?(?:express\s*\(\s*\)|express\.Router\s*\(|Router\s*\(|new\s+(?:Hono|Router|KoaRouter|Elysia|OpenAPIHono)\b|(?:Fastify|fastify)\s*\(|createRouter\s*\(|new\s+Koa\s*\()/g;
 const FRAMEWORK_IMPORT_RE = /(?:require\(\s*|\bfrom\s+)['"](?:express|fastify|koa|@koa\/router|koa-router|hono|elysia|restify|polka|@hono\/node-server)['"]/;
 const DEFAULT_ROUTER_NAMES = ['app', 'router', 'server', 'api', 'fastify', 'r', 'routes', 'route', 'apiRouter', 'v1'];
-const IMPORT_RE = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*['"](\.{1,2}\/[^'"]+)['"]\s*\)|\bimport\s+([A-Za-z_$][\w$]*)\s+from\s+['"](\.{1,2}\/[^'"]+)['"]/g;
+// default/namespace imports: const x = require('…'), import x from '…', import * as x from '…'
+const IMPORT_RE = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)|\bimport\s+(?:\*\s+as\s+)?([A-Za-z_$][\w$]*)\s+from\s+['"]([^'"]+)['"]/g;
+const NAMED_IMPORT_RE = /\bimport\s*(?:[A-Za-z_$][\w$]*\s*,\s*)?\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]|\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\(\s*['"]([^'"]+)['"]\s*\)/g;
 const NEXT_EXPORT_RE = /\bexport\s+(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b|\bexport\s+const\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s*=/g;
 const NEXT_REEXPORT_RE = /\bexport\s*\{([^}]*)\}/g;
 const NEST_CONTROLLER_RE = /@Controller\(\s*(?:['"`]([^'"`]*)['"`])?/;
 const NEST_ROUTE_RE = /@(Get|Post|Put|Patch|Delete|All)\(\s*(?:['"`]([^'"`]*)['"`])?\s*\)/g;
+// A default export that is a request handler (not a config object).
+const HANDLER_EXPORT_RE = /\bexport\s+default\s+(?:async\s+)?function\b|\bexport\s+default\s+(?:async\s*)?\(|\bmodule\.exports\s*=\s*(?:async\s*)?(?:function\b|\()|\bexports\.handler\s*=|\bexport\s+(?:async\s+)?function\s+(?:GET|POST|PUT|PATCH|DELETE|handler)\b|\bexport\s+const\s+(?:GET|POST|PUT|PATCH|DELETE|handler)\s*=/;
+// Calls that are never user helpers worth following.
+const NOT_HELPERS = new Set(['if', 'for', 'while', 'switch', 'catch', 'return', 'function', 'require', 'import', 'await', 'async', 'typeof', 'new', 'super', 'json', 'send', 'status', 'end', 'next', 'then', 'parse', 'stringify', 'String', 'Number', 'Boolean', 'Object', 'Array', 'Promise', 'Error', 'Date', 'Math', 'JSON', 'Response', 'NextResponse', 'console', 'setTimeout', 'fetch', 'req', 'res', 'request', 'response', 'ctx', 'c', 'reply', 'event', 'context', 'err', 'error', 'e', 'data', 'body', 'params', 'query', 'id']);
 
 const cache = new WeakMap();
+const ctxCache = new WeakMap();
+
+/** Per-repo caches for function lookups and import maps, shared by discovery and fileHelpers. */
+function ctxFor(repo) {
+  if (!ctxCache.has(repo)) ctxCache.set(repo, { repo, fnCache: new Map(), importCache: new Map() });
+  return ctxCache.get(repo);
+}
 
 function getRoutes(repo) {
   if (cache.has(repo)) return cache.get(repo);
@@ -5792,41 +6207,34 @@ function discover(repo) {
   const code = repo.sources({ kinds: ['code'], tests: false, js: true }).filter((f) => !f.rel.endsWith('.d.ts'));
   const mounts = []; // { from, target, prefix, middleware, line }
   const fileMiddleware = new Map(); // rel -> middleware text from .use(<no path>, …)
+  const ctx = ctxFor(repo);
 
   for (const f of code) {
     const text = repo.code(f);
     if (!text) continue;
     const side = repo.side(f);
     const rel = f.rel;
+    const before = routes.length;
 
     // ── file-system routed frameworks ──
     if (/(?:^|\/)(?:src\/)?app\/(?:.+\/)?route\.[cm]?[jt]s$/.test(rel)) {
       addNextAppRoutes(repo, f, text, routes);
-      continue;
-    }
-    if (/(?:^|\/)(?:src\/)?pages\/api\//.test(rel)) {
+    } else if (/(?:^|\/)(?:src\/)?pages\/api\//.test(rel)) {
       routes.push(fileRoute(repo, f, text, 'ANY', `/${rel.replace(/^.*?pages\//, '').replace(/\.[cm]?[jt]sx?$/, '').replace(/\/index$/, '')}`, 'next-pages-api'));
-      continue;
-    }
-    if (/\+server\.[jt]s$/.test(rel)) {
+    } else if (/\+server\.[jt]s$/.test(rel)) {
       addNextAppRoutes(repo, f, text, routes, 'sveltekit');
-      continue;
+    } else if (/(?:^|\/)netlify\/(?:edge-)?functions\//.test(rel)) {
+      routes.push(fileRoute(repo, f, text, 'ANY', `/.netlify/functions/${path.posix.basename(rel).replace(/\.[cm]?[jt]s$/, '')}`, 'netlify-function'));
+    } else if (/(?:^|\/)supabase\/functions\/([^/]+)\/index\.[jt]s$/.test(rel)) {
+      const name = /supabase\/functions\/([^/]+)\//.exec(rel)[1];
+      routes.push(fileRoute(repo, f, text, 'ANY', `/functions/v1/${name}`, 'supabase-edge-function'));
+    } else if (isVercelFunction(repo, f, text)) {
+      const pkg = repo.pkgFor(rel);
+      const local = pkg && pkg.dir ? rel.slice(pkg.dir.length + 1) : rel;
+      routes.push(fileRoute(repo, f, text, 'ANY', `/${local.replace(/\.[cm]?[jt]s$/, '').replace(/\/index$/, '')}`, 'vercel-function'));
     }
     if (/\+page\.server\.[jt]s$/.test(rel) && /\bexport\s+const\s+actions\b/.test(text)) {
       routes.push(fileRoute(repo, f, text, 'POST', routePathFromDir(rel, 'routes'), 'sveltekit-action', text.search(/\bexport\s+const\s+actions\b/)));
-    }
-    if (/(?:^|\/)netlify\/(?:edge-)?functions\//.test(rel)) {
-      routes.push(fileRoute(repo, f, text, 'ANY', `/.netlify/functions/${path.posix.basename(rel).replace(/\.[cm]?[jt]s$/, '')}`, 'netlify-function'));
-      continue;
-    }
-    if (/(?:^|\/)supabase\/functions\/([^/]+)\/index\.[jt]s$/.test(rel)) {
-      const name = /supabase\/functions\/([^/]+)\//.exec(rel)[1];
-      routes.push(fileRoute(repo, f, text, 'ANY', `/functions/v1/${name}`, 'supabase-edge-function'));
-      continue;
-    }
-    if (/(?:^|\/)api\//.test(rel) && !/(?:^|\/)src\//.test(rel) && !repo.depsFor(rel).has('next') && /\bexport\s+default\b|module\.exports\s*=|exports\.handler/.test(text) && !FRAMEWORK_IMPORT_RE.test(text)) {
-      routes.push(fileRoute(repo, f, text, 'ANY', `/${rel.slice(rel.search(/(?:^|\/)api\//)).replace(/^\//, '').replace(/\.[cm]?[jt]s$/, '')}`, 'vercel-function'));
-      continue;
     }
     if (/(?:^|\/)functions\//.test(rel) && /\b(?:onRequest|onCall)\s*\(/.test(text)) {
       for (const m of text.matchAll(/\bexports\.(\w+)\s*=|export\s+const\s+(\w+)\s*=\s*(?:functions\.)?(?:https\.)?(?:onRequest|onCall)/g)) {
@@ -5838,25 +6246,42 @@ function discover(repo) {
         routes.push(windowRoute(repo, f, text, m.index, 'POST', `action:${m[1] || m[2]}`, 'server-action'));
       }
     }
-    if (/(?:^|\/)app\/routes\//.test(rel) && (repo.depsFor(rel).has('@remix-run/node') || repo.depsFor(rel).has('@remix-run/react') || repo.depsFor(rel).has('@react-router/dev') || repo.depsFor(rel).has('react-router'))) {
+    if (/(?:^|\/)app\/routes\//.test(rel) && ['@remix-run/node', '@remix-run/react', '@react-router/dev', 'react-router'].some((d) => repo.depsFor(rel).has(d))) {
       for (const m of text.matchAll(/\bexport\s+(?:async\s+)?function\s+(action|loader)\b|\bexport\s+const\s+(action|loader)\s*=/g)) {
         const kind = m[1] || m[2];
         routes.push(windowRoute(repo, f, text, m.index, kind === 'action' ? 'POST' : 'GET', `/${rel.replace(/^.*?app\/routes\//, '').replace(/\.[cm]?[jt]sx?$/, '')}`, `remix-${kind}`));
       }
     }
 
-    // ── NestJS controllers ──
+    // ── NestJS controllers: one window per route method, decorators included ──
     if (/@Controller\(/.test(text)) {
       const ctrl = NEST_CONTROLLER_RE.exec(text);
       const prefix = ctrl && ctrl[1] ? `/${ctrl[1].replace(/^\//, '')}` : '';
       const classGuards = /@UseGuards\([^)]*\)\s*(?:@\w+\([^)]*\)\s*)*export\s+class/.test(text) ? '@UseGuards' : '';
-      for (const m of text.matchAll(NEST_ROUTE_RE)) {
-        const r = windowRoute(repo, f, text, m.index, m[1].toUpperCase(), `${prefix}/${(m[2] || '').replace(/^\//, '')}`.replace(/\/$/, '') || '/', 'nestjs');
-        // decorators above the method also count
-        r.text = `${text.slice(Math.max(0, m.index - 300), m.index)}\n${r.text}`;
-        r.mountMiddleware = classGuards;
-        routes.push(r);
-      }
+      const found = [...text.matchAll(NEST_ROUTE_RE)];
+      const starts = found.map((m) => decoratorStart(text, m.index));
+      found.forEach((m, i) => {
+        const start = starts[i];
+        const end = i + 1 < found.length ? starts[i + 1] : text.length;
+        routes.push({
+          file: f,
+          line: repo.lineOf(f, m.index),
+          method: m[1].toUpperCase(),
+          path: `${prefix}/${(m[2] || '').replace(/^\//, '')}`.replace(/\/$/, '') || '/',
+          framework: 'nestjs',
+          start,
+          end,
+          text: text.slice(start, Math.min(end, start + 8000)),
+          mountMiddleware: classGuards,
+        });
+      });
+    }
+
+    const imports = resolveImports(ctx, f, text);
+    const named = resolveNamedImports(ctx, f, text);
+    if (routes.length > before) {
+      const reexports = reexportSegments(ctx, f, text);
+      for (let i = before; i < routes.length; i++) routes[i].extra = [...helperSegments(ctx, f, routes[i].text, imports, named), ...reexports];
     }
 
     // ── router-style frameworks (Express, Fastify, Hono, Koa, Elysia…) ──
@@ -5865,21 +6290,27 @@ function discover(repo) {
     const frameworkFile = FRAMEWORK_IMPORT_RE.test(text) || created.length > 0;
     if (!frameworkFile && side !== 'server') continue;
     const names = new Set([...created, ...(frameworkFile ? DEFAULT_ROUTER_NAMES : ['app', 'router'])]);
-    const imports = resolveImports(repo, f, text);
-    const named = resolveNamedImports(repo, f, text);
 
     const fileRoutes = [];
     for (const m of text.matchAll(ROUTE_CALL_RE)) {
       if (!names.has(m[1])) continue;
-      const method = m[2] === 'del' ? 'DELETE' : m[2].toUpperCase();
-      fileRoutes.push({ index: m.index, method, path: m[4] });
+      fileRoutes.push({ index: m.index, method: m[2] === 'del' ? 'DELETE' : m[2].toUpperCase(), path: m[4] });
     }
-    // router.route('/x').get(...).post(...)
+    // router.route('/x').get(...).post(...): each chained method is its own route, with its own window
     for (const m of text.matchAll(/\b([A-Za-z_$][\w$]*)\s*\.\s*route\s*\(\s*(['"`])([/*][^'"`\n]*)\2\s*\)/g)) {
       if (!names.has(m[1])) continue;
-      const tail = text.slice(m.index + m[0].length, m.index + m[0].length + 600);
-      for (const c of tail.matchAll(new RegExp(`^\\s*\\.\\s*(${METHODS})\\s*\\(|\\)\\s*\\.\\s*(${METHODS})\\s*\\(`, 'g'))) {
-        fileRoutes.push({ index: m.index, method: (c[1] || c[2]).toUpperCase(), path: m[3] });
+      const tailStart = m.index + m[0].length;
+      const stop = text.slice(tailStart).search(/;|\n\s*\n|\.\s*route\s*\(/);
+      const tail = text.slice(tailStart, stop === -1 ? text.length : tailStart + stop);
+      let depth = 0;
+      for (let i = 0; i < tail.length; i++) {
+        const ch = tail[i];
+        if (ch === '(' || ch === '[' || ch === '{') depth++;
+        else if (ch === ')' || ch === ']' || ch === '}') depth--;
+        else if (ch === '.' && depth === 0) {
+          const mm = new RegExp(`^\\.\\s*(${METHODS})\\s*\\(`).exec(tail.slice(i));
+          if (mm) fileRoutes.push({ index: tailStart + i, method: mm[1] === 'del' ? 'DELETE' : mm[1].toUpperCase(), path: m[3], chained: true });
+        }
       }
     }
     // fastify.route({ method: 'POST', url: '/x', ... })
@@ -5894,7 +6325,10 @@ function discover(repo) {
     for (let i = 0; i < fileRoutes.length; i++) {
       const r = fileRoutes[i];
       const next = fileRoutes[i + 1];
-      const end = Math.min(next ? next.index : text.length, r.index + 4000);
+      // the route call itself (handler included) when it closes; else up to the next route
+      const open = text.indexOf('(', r.index);
+      const call = open !== -1 && splitArgs(text, open);
+      const end = call ? call.end + 1 : Math.min(next ? next.index : text.length, r.index + 4000);
       const route = {
         file: f,
         line: repo.lineOf(f, r.index),
@@ -5906,9 +6340,10 @@ function discover(repo) {
         end,
         text: text.slice(r.index, end),
         mountMiddleware: '',
-        handler: null,
+        handler: resolveHandler(ctx, f, text, r.index + (r.chained ? text.slice(r.index).indexOf('(') : 0), imports, named),
       };
-      route.handler = resolveHandler(repo, f, text, r.index, imports, named);
+      route.extra = helperSegments(ctx, f, route.text, imports, named);
+      if (route.handler) route.extra.push(...helperSegments(ctx, route.handler.file, route.handler.text, resolveImports(ctx, route.handler.file, repo.code(route.handler.file) || ''), resolveNamedImports(ctx, route.handler.file, repo.code(route.handler.file) || '')));
       routes.push(route);
     }
 
@@ -5930,7 +6365,7 @@ function discover(repo) {
       const targets = [];
       for (const a of rest) {
         const id = /^[A-Za-z_$][\w$]*$/.test(a) ? a : null;
-        const req = /^require\(\s*['"](\.{1,2}\/[^'"]+)['"]\s*\)$/.exec(a);
+        const req = /^require\(\s*['"]([^'"]+)['"]\s*\)$/.exec(a);
         if (id && imports.has(id)) targets.push(imports.get(id));
         else if (req) {
           const target = resolveModule(repo, f.rel, req[1]);
@@ -5940,6 +6375,11 @@ function discover(repo) {
       const middleware = rest.filter((a) => !targets.length || !(imports.has(a) || /^require\(/.test(a))).join(', ');
       if (targets.length) {
         for (const t of targets) mounts.push({ from: f.rel, target: t, prefix, middleware, line: repo.lineOf(f, m.index) });
+      } else if (/^\w+\.path$/.test(args[0] || '') && /^\w+\.route$/.test(args[1] || '')) {
+        // routers mounted from an array: [{ path: '/auth', route: authRoute }].forEach((r) => router.use(r.path, r.route))
+        for (const e of text.matchAll(/\{\s*path\s*:\s*(['"`])([^'"`]+)\1\s*,\s*route\s*:\s*([A-Za-z_$][\w$]*)\s*,?\s*\}/g)) {
+          if (imports.has(e[3])) mounts.push({ from: f.rel, target: imports.get(e[3]), prefix: e[2], middleware: '', line: repo.lineOf(f, e.index) });
+        }
       } else if (!prefix || prefix === '/' || prefix === '*') {
         fileMiddleware.set(f.rel, `${fileMiddleware.get(f.rel) || ''}\n${args.join(', ')}`);
       } else {
@@ -5959,9 +6399,10 @@ function discover(repo) {
     const out = [];
     for (const p of parents) {
       for (const up of chainFor(p.from, depth + 1)) {
-        const scoped = mounts.filter((x) => !x.target && x.from === p.from && (`${up.prefix}${p.prefix}`.startsWith(x.prefix) || p.prefix.startsWith(x.prefix)));
+        const full = `${up.prefix}${p.prefix}`;
+        const scoped = mounts.filter((x) => !x.target && x.from === p.from && (full.startsWith(x.prefix) || p.prefix.startsWith(x.prefix)));
         out.push({
-          prefix: `${up.prefix}${p.prefix}`,
+          prefix: full,
           middleware: [up.middleware, p.middleware, fileMiddleware.get(rel) || '', ...scoped.map((x) => x.middleware)].filter(Boolean).join('\n'),
         });
       }
@@ -5970,8 +6411,7 @@ function discover(repo) {
   };
   for (const r of routes) {
     if (r.framework !== 'router') continue;
-    const chain = chainFor(r.file.rel);
-    const c = chain[0];
+    const c = chainFor(r.file.rel)[0];
     r.path = joinPath(c.prefix, r.localPath);
     const scoped = mounts.filter((x) => !x.target && x.from === r.file.rel && r.localPath.startsWith(x.prefix));
     r.mountMiddleware = [c.middleware, ...scoped.map((x) => x.middleware)].filter(Boolean).join('\n');
@@ -5981,14 +6421,112 @@ function discover(repo) {
   return { routes, mounts, fileMiddleware, nextMiddleware: findNextMiddleware(repo) };
 }
 
+/** Vercel-style function: a file under api/ at a package root whose default export handles requests. */
+function isVercelFunction(repo, f, text) {
+  if (repo.depsFor(f.rel).has('next') || FRAMEWORK_IMPORT_RE.test(text)) return false;
+  if (/\.config\.[cm]?[jt]s$|(?:^|\/)types?\.[jt]s$|(?:^|\/)_[^/]*$/.test(f.rel)) return false;
+  const pkg = repo.pkgFor(f.rel);
+  const base = pkg && pkg.dir ? `${pkg.dir}/` : '';
+  if (!f.rel.startsWith(`${base}api/`)) return false;
+  if (HANDLER_EXPORT_RE.test(text)) return true;
+  const named = /\bexport\s+default\s+([A-Za-z_$][\w$]*)\s*;?/.exec(text);
+  return Boolean(named && new RegExp(`(?:function\\s+${escapeRegExp(named[1])}\\s*\\(|(?:const|let|var)\\s+${escapeRegExp(named[1])}\\s*=\\s*(?:async\\s*)?(?:function\\b|\\())`).test(text));
+}
+
+/** Index where a decorated method's decorator block starts (walks up over lines starting with @). */
+function decoratorStart(text, index) {
+  let start = text.lastIndexOf('\n', index - 1) + 1;
+  for (;;) {
+    const prevEnd = start - 1;
+    if (prevEnd <= 0) break;
+    const prevStart = text.lastIndexOf('\n', prevEnd - 1) + 1;
+    const line = text.slice(prevStart, prevEnd).trim();
+    if (line.startsWith('@') || (line.endsWith(')') && /^[\w\s,'"`{}:.\-[\]]*\)$/.test(line) && /@\w+\(/.test(text.slice(Math.max(0, prevStart - 200), prevStart)))) start = prevStart;
+    else break;
+  }
+  return start;
+}
+
+/** Find a function named `name` in `text`: declaration, const arrow/function, or object/class method. */
+function findFunction(ctx, file, name) {
+  const key = `${file.rel}#${name}`;
+  if (ctx.fnCache.has(key)) return ctx.fnCache.get(key);
+  const text = ctx.repo.code(file) || '';
+  const n = escapeRegExp(name);
+  // declarations, const arrows/functions, wrapped handlers (const x = catchAsync(async (req) => …)), methods
+  const def = new RegExp(`(?:async\\s+)?function\\s*\\*?\\s*${n}\\s*\\(|\\b(?:const|let|var)\\s+${n}\\s*(?::[^=]{1,200})?=\\s*(?:async\\s*)?(?:function\\b|\\(|[A-Za-z_$][\\w$]*\\s*=>|(?!require\\b|import\\b)[A-Za-z_$][\\w$.]*\\s*\\(\\s*(?:async\\b|function\\b|\\(|[A-Za-z_$][\\w$]*\\s*=>))|\\b${n}\\s*:\\s*(?:async\\s*)?(?:function\\b|\\()|^\\s*(?:public\\s+|private\\s+|protected\\s+|static\\s+)*(?:async\\s+)?${n}\\s*\\([^)]*\\)\\s*(?::[^{]{1,200})?\\{`, 'm').exec(text);
+  let result = null;
+  if (def) {
+    const rest = text.slice(def.index + 10);
+    const stop = rest.search(/\n(?:export\s+)?(?:async\s+)?function\s|\n(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?(?:function\b|\()|\nmodule\.exports|\nexport\s/);
+    const end = stop === -1 ? text.length : def.index + 10 + stop;
+    result = { file, start: def.index, end, text: text.slice(def.index, Math.min(end, def.index + 6000)) };
+  }
+  ctx.fnCache.set(key, result);
+  return result;
+}
+
+/** A module's default-exported function (module.exports = function…, export default function…). */
+function defaultExport(ctx, rel) {
+  const file = ctx.repo.get(rel);
+  if (!file) return null;
+  const body = ctx.repo.code(file) || '';
+  const def = /\bmodule\.exports\s*=\s*(?:async\s*)?(?:function\b|\()|\bexport\s+default\s+(?:async\s+)?(?:function\b|\()/.exec(body);
+  if (def) return { file, start: def.index, end: body.length, text: body.slice(def.index, def.index + 6000) };
+  const named = /\bexport\s+default\s+([A-Za-z_$][\w$]*)\s*;?\s*$/m.exec(body) || /\bmodule\.exports\s*=\s*([A-Za-z_$][\w$]*)\s*;?\s*$/m.exec(body);
+  return named ? findFunction(ctx, file, named[1]) : null;
+}
+
+/** The whole module (capped) as a segment: route files that re-export their handler from it. */
+function moduleSegment(ctx, rel) {
+  const file = ctx.repo.get(rel);
+  if (!file) return null;
+  const text = ctx.repo.code(file) || '';
+  return { file, start: 0, end: text.length, text: text.slice(0, 20000) };
+}
+
+/**
+ * One hop of helpers: functions this text calls or passes along (getHandler in
+ * `export const GET = withX(getHandler)`, verifyAccess(...) in a handler), resolved in the same
+ * file or through imports, plus imported objects passed as arguments (a tRPC router).
+ */
+function helperSegments(ctx, file, text, imports, named, limit = 6) {
+  const out = [];
+  const seen = new Set();
+  const consider = (name) => {
+    if (seen.has(name) || NOT_HELPERS.has(name) || out.length >= limit) return;
+    seen.add(name);
+    const local = findFunction(ctx, file, name);
+    if (local) {
+      out.push(local);
+      return;
+    }
+    // Imported functions only, never whole modules (a shared prisma/db module would make every
+    // route look like it checks auth because it mentions a session), except routers handed to
+    // an adapter: createNextApiHandler(adminRouter) is guarded by its procedures.
+    if (named.has(name)) {
+      const target = ctx.repo.get(named.get(name).target);
+      const fn = target && findFunction(ctx, target, named.get(name).name);
+      const seg = fn || (/[a-z]Router$|^router$/.test(name) && moduleSegment(ctx, named.get(name).target));
+      if (seg) out.push(seg);
+    } else if (imports.has(name)) {
+      const fn = defaultExport(ctx, imports.get(name));
+      if (fn) out.push(fn);
+    }
+  };
+  for (const m of text.matchAll(/(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(/g)) consider(m[1]);
+  for (const m of text.matchAll(/[(,]\s*([A-Za-z_$][\w$]*)\s*(?=[,)])/g)) consider(m[1]);
+  return out;
+}
+
 /**
  * For `app.post('/x', mw, controller.create)` find the body of controller.create (in this file
  * or an imported module), so checks can look inside handlers defined elsewhere.
  */
-function resolveHandler(repo, f, text, callIndex, imports, named = new Map()) {
+function resolveHandler(ctx, f, text, callIndex, imports, named = new Map()) {
   const open = text.indexOf('(', callIndex);
   const call = splitArgs(text, open);
-  if (!call || call.args.length < 2) return null;
+  if (!call || !call.args.length) return null;
   const last = call.args[call.args.length - 1].text;
   const ref = /^([A-Za-z_$][\w$]*)(?:\.([A-Za-z_$][\w$]*))?$/.exec(last);
   if (!ref) return null;
@@ -5997,42 +6535,61 @@ function resolveHandler(repo, f, text, callIndex, imports, named = new Map()) {
   if (ref[2]) {
     const target = imports.get(ref[1]);
     if (!target) return null;
-    file = repo.get(target);
+    file = ctx.repo.get(target);
     name = ref[2];
   } else if (named.has(ref[1])) {
-    file = repo.get(named.get(ref[1]).target);
+    file = ctx.repo.get(named.get(ref[1]).target);
     name = named.get(ref[1]).name;
   } else if (imports.has(ref[1])) {
-    file = repo.get(imports.get(ref[1]));
+    file = ctx.repo.get(imports.get(ref[1]));
     name = null; // default export of the module is the handler
   }
   if (!file) return null;
-  const body = repo.code(file) || '';
-  let start = -1;
   if (name) {
-    const def = new RegExp(`(?:async\\s+)?function\\s+${name.replace(/[$]/g, '\\$')}\\s*\\(|\\b(?:const|let|var)\\s+${name.replace(/[$]/g, '\\$')}\\s*=\\s*(?:async\\s*)?(?:function\\b|\\()|\\b${name.replace(/[$]/g, '\\$')}\\s*:\\s*(?:async\\s*)?(?:function\\b|\\()|\\b(?:async\\s+)?${name.replace(/[$]/g, '\\$')}\\s*\\([^)]*\\)\\s*\\{`).exec(body);
-    if (!def) return null;
-    start = def.index;
-    if (file === f && start >= callIndex && start < callIndex + 50) return null; // the route call itself
-  } else {
-    const def = /\bmodule\.exports\s*=\s*(?:async\s*)?(?:function\b|\()|\bexport\s+default\s+(?:async\s+)?(?:function\b|\()/.exec(body);
-    if (!def) return null;
-    start = def.index;
+    const fn = findFunction(ctx, file, name);
+    if (!fn || (file === f && fn.start >= callIndex && fn.start < callIndex + 50)) return null; // the route call itself
+    return fn;
   }
-  const rest = body.slice(start + 10);
-  const stop = rest.search(/\n(?:async\s+)?function\s|\n(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?(?:function\b|\()|\nmodule\.exports|\nexport\s/);
-  const end = stop === -1 ? body.length : start + 10 + stop;
-  return { file, start, end, text: body.slice(start, Math.min(end, start + 6000)) };
+  return defaultExport(ctx, file.rel);
 }
 
-/** Text segments of a route to scan: the route call itself, plus the resolved handler body. */
-function segments(r) {
-  const out = [{ file: r.file, start: r.start, text: r.text }];
-  if (r.handler && !(r.handler.file === r.file && r.handler.start >= r.start && r.handler.start < r.end)) out.push({ file: r.handler.file, start: r.handler.start, text: r.handler.text });
+/** Modules a route file re-exports its handlers from: export { default } from '…', export { POST } from '…'. */
+function reexportSegments(ctx, f, text) {
+  const out = [];
+  for (const m of text.matchAll(/\bexport\s*(?:\*|\{[^}]*\b(?:default|GET|POST|PUT|PATCH|DELETE|handler|action|loader)\b[^}]*\})\s*from\s*['"]([^'"]+)['"]/g)) {
+    const target = resolveModule(ctx.repo, f.rel, m[1]);
+    const seg = target && moduleSegment(ctx, target);
+    if (!seg) continue;
+    // the re-exported module is the real route file: include its helpers too
+    const text2 = ctx.repo.code(seg.file) || '';
+    out.push(seg, ...helperSegments(ctx, seg.file, text2, resolveImports(ctx, seg.file, text2), resolveNamedImports(ctx, seg.file, text2)));
+  }
   return out;
 }
 
-/** Route call + handler body as one string (for presence tests, not for line numbers). */
+/** One hop of helpers a whole file calls (same file or imported), e.g. the guard an admin page awaits. */
+function fileHelpers(repo, f) {
+  const ctx = ctxFor(repo);
+  const text = repo.code(f) || '';
+  return helperSegments(ctx, f, text, resolveImports(ctx, f, text), resolveNamedImports(ctx, f, text), 12).filter((s) => s.file !== f);
+}
+
+/**
+ * Text segments of a route: the route itself, the handler it references and one hop of
+ * helpers. With helpers: false, only helpers defined in the route's own file are kept
+ * (export const POST = withX(postHandler) → postHandler). Presence tests (is there an auth
+ * check?) want every helper; checks that flag code (this query lists every row) should not
+ * look inside shared helpers, whose generic queries are not the route's.
+ */
+function segments(r, { helpers = true } = {}) {
+  const out = [{ file: r.file, start: r.start, text: r.text }];
+  const covered = (s) => out.some((o) => o.file === s.file && s.start >= o.start && s.start < o.start + o.text.length);
+  const extra = (r.extra || []).filter((s) => helpers || s.file === r.file);
+  for (const s of [r.handler, ...extra]) if (s && !covered(s)) out.push({ file: s.file, start: s.start, text: s.text });
+  return out;
+}
+
+/** Route + handler + helpers as one string (for presence tests, not for line numbers). */
 function routeBody(r) {
   return segments(r)
     .map((s) => s.text)
@@ -6099,47 +6656,76 @@ function firstHandlerIndex(text) {
   return m ? m.index : 0;
 }
 
-function resolveImports(repo, f, text) {
+function resolveImports(ctx, f, text) {
+  const key = `d:${f.rel}`;
+  if (ctx.importCache.has(key)) return ctx.importCache.get(key);
   const map = new Map();
   for (const m of text.matchAll(IMPORT_RE)) {
-    const name = m[1] || m[3];
-    const spec = m[2] || m[4];
-    const target = resolveModule(repo, f.rel, spec);
-    if (target) map.set(name, target);
+    const target = resolveModule(ctx.repo, f.rel, m[2] || m[4]);
+    if (target) map.set(m[1] || m[3], target);
   }
+  ctx.importCache.set(key, map);
   return map;
 }
 
 /** Named imports: `import { a, b as c } from './x'` and `const { a } = require('./x')` → local → { target, name }. */
-function resolveNamedImports(repo, f, text) {
+function resolveNamedImports(ctx, f, text) {
+  const key = `n:${f.rel}`;
+  if (ctx.importCache.has(key)) return ctx.importCache.get(key);
   const map = new Map();
-  const re = /\bimport\s*\{([^}]*)\}\s*from\s*['"](\.{1,2}\/[^'"]+)['"]|\b(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\(\s*['"](\.{1,2}\/[^'"]+)['"]\s*\)/g;
-  for (const m of text.matchAll(re)) {
-    const target = resolveModule(repo, f.rel, m[2] || m[4]);
+  for (const m of text.matchAll(NAMED_IMPORT_RE)) {
+    const target = resolveModule(ctx.repo, f.rel, m[2] || m[4]);
     if (!target) continue;
     for (const part of (m[1] || m[3]).split(',')) {
-      const bits = part.trim().split(/\s+as\s+|\s*:\s*/);
+      const bits = part.trim().replace(/^type\s+/, '').split(/\s+as\s+|\s*:\s*/);
       const original = bits[0] && bits[0].trim();
       const local = (bits[1] || bits[0] || '').trim();
       if (/^[A-Za-z_$][\w$]*$/.test(local) && /^[A-Za-z_$][\w$]*$/.test(original)) map.set(local, { target, name: original });
     }
   }
+  ctx.importCache.set(key, map);
   return map;
 }
 
+/** Resolve an import specifier to a repo file: relative paths, @/ and ~/ aliases, and workspace packages. */
 function resolveModule(repo, fromRel, spec) {
-  const base = path.posix.normalize(path.posix.join(path.posix.dirname(fromRel), spec));
-  const candidates = [base, ...['.js', '.ts', '.mjs', '.cjs', '.jsx', '.tsx'].map((e) => base + e), ...['index.js', 'index.ts', 'index.mjs'].map((i) => `${base}/${i}`)];
-  for (const c of candidates) if (repo.get(c)) return c;
+  const bases = [];
+  if (spec.startsWith('.')) bases.push(path.posix.normalize(path.posix.join(path.posix.dirname(fromRel), spec)));
+  else if (/^[@~]\//.test(spec)) {
+    const pkg = repo.pkgFor(fromRel);
+    const root = pkg && pkg.dir ? `${pkg.dir}/` : '';
+    bases.push(`${root}src/${spec.slice(2)}`, `${root}${spec.slice(2)}`);
+  } else {
+    for (const p of repo.packages) {
+      const name = p.json && p.json.name;
+      if (name && (spec === name || spec.startsWith(`${name}/`))) {
+        const sub = spec.slice(name.length).replace(/^\//, '');
+        const dir = p.dir ? `${p.dir}/` : '';
+        bases.push(sub ? `${dir}${sub}` : `${dir}index`, sub ? `${dir}src/${sub}` : `${dir}src/index`);
+      }
+    }
+  }
+  for (const base of bases) {
+    const candidates = [base, ...['.js', '.ts', '.mjs', '.cjs', '.jsx', '.tsx'].map((e) => base + e), ...['index.js', 'index.ts', 'index.mjs', 'index.tsx'].map((i) => `${base}/${i}`)];
+    for (const c of candidates) if (repo.get(c)) return c;
+  }
   return null;
 }
 
-// ── Next.js middleware.ts ──────────────────────────────────────────────────
+// ── Next.js middleware.ts / proxy.ts ──────────────────────────────────────
 
 const NEXT_MW_AUTH_RE = /\b(?:clerkMiddleware|authMiddleware|withAuth|auth\s*\(|NextAuth|getToken\s*\(|updateSession\s*\(|createServerClient\s*\(|supabase\.auth\.getUser|getSession\s*\(|verifyToken|jwtVerify|kindeAuth|withMiddlewareAuthRequired|authkitMiddleware|betterFetch|getSessionCookie)/;
 
 function findNextMiddleware(repo) {
-  const f = repo.files.find((x) => /^(?:(?:[^/]+\/)*?)(?:src\/)?middleware\.[jt]s$/.test(x.rel) && !x.build && repo.depsFor(x.rel).has('next'));
+  // Next.js 16 renamed middleware.ts to proxy.ts; both run before routes. They live at the
+  // app root or in src/ (a lib/proxy.ts helper elsewhere is not middleware).
+  const f = repo.files.find((x) => {
+    if (x.build || !/^(?:middleware|proxy)\.[jt]s$/.test(x.name) || !repo.depsFor(x.rel).has('next')) return false;
+    const pkg = repo.pkgFor(x.rel);
+    const dir = path.posix.dirname(x.rel) === '.' ? '' : path.posix.dirname(x.rel);
+    const root = pkg ? pkg.dir : '';
+    return dir === root || dir === (root ? `${root}/src` : 'src');
+  });
   if (!f) return null;
   const text = repo.code(f) || '';
   const auth = NEXT_MW_AUTH_RE.test(text) || /export\s*\{\s*default\s*\}\s*from\s*['"]next-auth\/middleware['"]/.test(text);
@@ -6162,7 +6748,7 @@ function findNextMiddleware(repo) {
   };
 }
 
-module.exports = { getRoutes, joinPath, segments, routeBody };
+module.exports = { getRoutes, joinPath, segments, routeBody, resolveModule, fileHelpers };
 },
 // ── lib/taint.js ──────────────────────────────────────────────────────────
 "lib/taint.js": function (module, exports, require) {

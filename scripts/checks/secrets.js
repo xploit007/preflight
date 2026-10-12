@@ -16,8 +16,8 @@ const { parseEnv, secretLabel } = require('./env');
 
 const IDS = ['SEC-01', 'SEC-03', 'SEC-04', 'SEC-05', 'SEC-06', 'SEC-07'];
 
-/** Passwords bots try first. */
-const DEFAULT_PASSWORDS = new Set(['admin', 'admin123', 'admin1234', 'administrator', 'password', 'password1', 'password123', 'passw0rd', 'p@ssw0rd', 'changeme', 'changeit', 'default', 'root', 'toor', 'letmein', 'secret', '123456', '12345678', '123456789', 'qwerty', 'test', 'test123', 'guest', 'demo', 'example', 'postgres', 'mysql', 'minioadmin', 'pass', '1234', 'welcome', 'welcome1']);
+/** Passwords bots try first (patterns.js shares them with redaction, which shows them as-is). */
+const { DEFAULT_PASSWORDS } = P;
 
 // DB password variables with a literal value: DB_PASSWORD=…, POSTGRES_PASSWORD: …
 const DB_PASS_VAR_RE = /\b((?:DB|DATABASE|PG|POSTGRES|MYSQL|MYSQL_ROOT|MARIADB|MARIADB_ROOT|MONGO|MONGODB|MONGO_INITDB_ROOT|REDIS|MSSQL|SA)_?(?:PASS(?:WORD)?|PWD))\b["']?\s*[:=]\s*["']?([^\s"'`#,;})]{4,})/gi;
@@ -36,7 +36,7 @@ const LIB_SECRET_RE = /\b(secret|secretOrKey|secretOrPrivateKey)\s*:\s*(['"`])([
 const IRON_PASSWORD_RE = /\bpassword\s*:\s*(['"`])([^'"`\n]{8,256})\1/g;
 const COOKIE_KEYS_RE = /\bkeys\s*:\s*\[\s*(['"`])([^'"`\n]{3,256})\1/g;
 const JOSE_LITERAL_RE = /new\s+TextEncoder\(\)\.encode\(\s*(['"`])([^'"`\n]{3,256})\1\s*\)/g;
-const CONFIG_SECRET_RE = /["']?(jwtSecret|jwt_secret|JWT_SECRET|sessionSecret|session_secret|secretKey|secret_key|tokenSecret|appSecret|cookieSecret)["']?\s*[:=]\s*["']([^"'\n]{3,256})["']/g;
+const CONFIG_SECRET_RE = /(?<![\w])["']?(jwtSecret|jwt_secret|JWT_SECRET|sessionSecret|session_secret|secretKey|secret_key|tokenSecret|appSecret|cookieSecret)["']?\s*[:=]\s*["']([^"'\n]{3,256})["']/g;
 // Docker/infra env vars that commonly ship with default passwords.
 const INFRA_DEFAULT_RE = /\b((?:POSTGRES|MYSQL|MYSQL_ROOT|MARIADB|MARIADB_ROOT|MONGO_INITDB_ROOT|RABBITMQ_DEFAULT|MINIO_ROOT|PGADMIN_DEFAULT|GF_SECURITY_ADMIN|REDIS|ADMIN|DEFAULT_ADMIN|KEYCLOAK_ADMIN|ELASTIC)_(?:PASSWORD|PASS))\b["']?\s*[:=]\s*["']?([^\s"'#,]+)/gi;
 const AI_CONTEXT_RE = /gemini|generativeai|@google\/genai|@google\/generative-ai|generativelanguage|GoogleGenerativeAI|GoogleGenAI/i;
@@ -72,10 +72,11 @@ function where(repo, f) {
 
 function dbCredentials(repo, claimed) {
   const hits = [];
-  const add = (f, index, note, weak = false) => {
+  const add = (f, index, note, weak = false, value = null) => {
     const line = repo.lineOf(f, index);
     if (repo.suppressed(f, line) || localOnly(repo, f)) return;
     claimed.add(`${f.rel}:${line}`);
+    repo.noteSecret(value);
     hits.push({ e: ev(f.rel, line, `${note}${where(repo, f)}`, repo.snippet(f, line)), weak });
   };
   for (const f of scanFiles(repo)) {
@@ -85,20 +86,22 @@ function dbCredentials(repo, claimed) {
     for (const d of P.findDbUrls(text)) {
       if (d.placeholder || /^[$%{]/.test(d.password)) continue;
       if (DEFAULT_PASSWORDS.has(d.password.toLowerCase())) continue; // SEC-07
-      if (d.local) add(f, d.index, `${d.scheme} URL with an inline password for local host "${d.host}"`, true);
-      else add(f, d.index, `${d.scheme} connection string with an inline password for ${d.host}`);
+      if (d.local) add(f, d.index, `${d.scheme} URL with an inline password for local host "${d.host}"`, true, d.password);
+      else add(f, d.index, `${d.scheme} connection string with an inline password for ${d.host}`, false, d.password);
     }
     for (const m of text.matchAll(DB_PASS_VAR_RE)) {
       const value = m[2];
       if (P.isPlaceholder(value) || /^[$%{]/.test(value) || /process\.env|import\.meta/.test(value)) continue;
       if (DEFAULT_PASSWORDS.has(value.toLowerCase())) continue; // SEC-07
-      add(f, m.index, `${m[1]} set to a literal value`);
+      // compose files, CI jobs and tests set the password of a throwaway container they start
+      const container = CONTAINER_CONFIG_RE.test(f.rel) || repo.isTest(f);
+      add(f, m.index, `${m[1]} set to a literal value${container ? ' for a container this file starts' : ''}`, container, value);
     }
     for (const m of text.matchAll(DB_CLIENT_RE)) {
       const windowText = text.slice(m.index, m.index + 800);
       const pm = /\bpassword\s*:\s*(['"`])([^'"`\n]{4,})\1/.exec(windowText);
       if (!pm || P.isPlaceholder(pm[2]) || pm[2].includes('${')) continue;
-      add(f, m.index + pm.index, 'literal password in a database client config');
+      add(f, m.index + pm.index, 'literal password in a database client config', false, pm[2]);
     }
   }
   const strong = hits.filter((h) => !h.weak);
@@ -106,6 +109,9 @@ function dbCredentials(repo, claimed) {
   if (hits.length) return warn('SEC-01', hits.map((h) => h.e), { question: 'These credentials point at local hosts. Are they dev-only, and is the same password used anywhere reachable?' });
   return pass('SEC-01', ['No database connection strings or DB passwords with literal values found in source or config.']);
 }
+
+const CONTAINER_CONFIG_RE = /(?:^|\/)(?:docker-)?compose[\w.-]*\.ya?ml$|(?:^|\/)\.github\/|(?:^|\/)\.circleci\/|(?:^|\/)\.gitlab-ci\.ya?ml$|(?:^|\/)bitbucket-pipelines\.ya?ml$/;
+const SAMPLE_FILE_RE = /(?:^|\/)(?:docs?|seeds?|seeders?)\/|(?:^|\/)seed[\w-]*\.[cm]?[jt]s$|(?:^|\/)(?:openapi|swagger)[\w.-]*\.(?:json|ya?ml)$/i;
 
 // ── SEC-03 ─────────────────────────────────────────────────────────────────
 
@@ -126,7 +132,8 @@ function hardcodedSecrets(repo, claimed) {
       if (s.google && !aiFile) continue; // Firebase/Maps browser keys are public by design
       const line = repo.lineOf(f, s.index);
       if (repo.suppressed(f, line) || localOnly(repo, f)) continue;
-      add(f, line, s.google ? 'Google AI (Gemini) API key' : s.label, Boolean(s.lowImpact));
+      repo.noteSecret(s.value);
+      add(f, line, s.google ? 'Google AI (Gemini) API key' : s.label, Boolean(s.lowImpact) || repo.isTest(f));
     }
     if (f.kind === 'doc' || f.rel.endsWith('.d.ts') || repo.isMinified(f) || /(?:^|\/)(?:locales?|i18n|lang|translations|messages)\//.test(f.rel)) continue;
     for (const m of text.matchAll(P.GENERIC_ASSIGN_RE)) {
@@ -134,16 +141,22 @@ function hardcodedSecrets(repo, claimed) {
       const value = m[3];
       const line = repo.lineOf(f, m.index);
       if (claimed.has(`${f.rel}:${line}`)) continue;
+      if (repo.isTest(f) || SAMPLE_FILE_RE.test(f.rel)) continue; // tests, seeds, docs and API specs hold sample credentials; only provider-format keys count there
+      if (/\bexamples?\s*[:=(]|@Api(?:Property|Response|Body)\b|@example\b/.test(text.slice(Math.max(0, m.index - 300), m.index))) continue; // documented example values
       if (P.PUBLIC_NAME_RE.test(name) || P.PUBLIC_VALUE_RE.test(value)) continue;
       if (P.isPlaceholder(value) || !P.looksSecret(value) || DEFAULT_PASSWORDS.has(value.toLowerCase())) continue;
+      // header/cookie/storage key names ('x-api-key', 'session_token') and values echoing the name
+      const norm = (x) => x.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (/^[a-z]+(?:[_-][a-z]+)+$/.test(value) || value.includes('${') || norm(name).endsWith(norm(value))) continue;
       if (P.findSecrets(value).length || P.findDbUrls(value).length) continue; // reported by the strong rules
       if (/^eyJ/.test(value) && P.supabaseRole(value) === 'anon') continue;
       if (isCommentLine(repo.lineText(f, line)) || repo.suppressed(f, line) || localOnly(repo, f)) continue;
-      add(f, line, `hardcoded value for "${name}"`, false);
+      repo.noteSecret(value);
+      add(f, line, `hardcoded value for "${name}"`, CONTAINER_CONFIG_RE.test(f.rel)); // CI/compose values configure throwaway test runs
     }
   }
   if (hits.some((h) => !h.weak)) return fail('SEC-03', hits.map((h) => h.e));
-  if (hits.length) return warn('SEC-03', hits.map((h) => h.e), { question: 'Only test-mode keys were found. Are they really test keys, and are live keys kept out of the repo?' });
+  if (hits.length) return warn('SEC-03', hits.map((h) => h.e), { question: 'Only test-mode or local-dev keys, values in tests, or values in CI/compose files were found. Are they all throwaway values, and are real keys kept out of the repo?' });
   return pass('SEC-03', ['No high-confidence secret formats or hardcoded credential assignments found outside .env files and build output.']);
 }
 
@@ -249,9 +262,10 @@ function historyFindings(repo, opts) {
     const depth = opts.historyDepth || 200;
     const found = new Map(); // value|file -> hit (oldest occurrence wins: log is newest-first)
     const { commits, truncated, error } = await streamGitLog(repo.root, depth, (a) => {
+      if (!P.SECRET_HINT_RE.test(a.text) || repo.userIgnored(a.file)) return; // most added lines can't hold a known secret format
       for (const s of P.findSecrets(a.text)) {
         if (s.google && !AI_CONTEXT_RE.test(a.text)) continue;
-        found.set(`${s.value}|${a.file}`, { ...a, label: s.google ? 'Google AI API key' : s.label, value: s.value, lowImpact: s.lowImpact, ai: s.ai || (s.google ? 'Google AI' : null) });
+        found.set(`${s.value}|${a.file}`, { ...a, label: s.google ? 'Google AI API key' : s.label, value: s.value, lowImpact: s.lowImpact || repo.isTest({ rel: a.file }), ai: s.ai || (s.google ? 'Google AI' : null) });
       }
       for (const d of P.findDbUrls(a.text)) {
         if (d.placeholder || d.local || /^[$%{]/.test(d.password)) continue;
@@ -267,7 +281,7 @@ function historyFindings(repo, opts) {
         if (line.startsWith('\0')) header = line.slice(1).trim();
         else if (line.trim()) {
           const base = path.posix.basename(line.trim());
-          if (!ENV_FILE_RE.test(base) || /(?:example|sample|template|dist|defaults|schema)/i.test(base)) continue;
+          if (!ENV_FILE_RE.test(base) || /(?:example|sample|template|dist|defaults|schema)/i.test(base) || repo.userIgnored(line.trim())) continue;
           // Only env files that held secret-looking values count (public config like NEXT_PUBLIC_* is fine).
           const sha = header.split(' ')[0];
           const content = repo.git.run(['cat-file', 'blob', `${sha}:./${line.trim()}`]) || ''; // cat-file never runs textconv/filters
@@ -276,7 +290,8 @@ function historyFindings(repo, opts) {
         }
       }
     }
-    return { commits, truncated, found, envAdds };
+    const shallow = (repo.git.run(['rev-parse', '--is-shallow-repository']) || '').trim() === 'true';
+    return { commits, truncated, found, envAdds, shallow };
   })();
   return repo._history;
 }
@@ -295,11 +310,12 @@ async function gitHistory(repo, opts) {
   const evidence = [...h.found.values()].map((x) => historyEvidence(repo, x));
   for (const a of h.envAdds) evidence.push(ev(a.file, null, `env file with ${a.count} secret-looking value${a.count > 1 ? 's' : ''} committed in ${a.header}; every value in it is readable in history`));
   if (h.truncated) evidence.push(`History scan stopped early (time/size budget); scanned ${h.commits} commits.`);
+  if (h.shallow) evidence.push('Shallow clone: commits older than the clone depth are not available here and were not scanned. Re-run on a full clone (git fetch --unshallow) for a complete history scan.');
   if (h.found.size || h.envAdds.length) {
-    if ([...h.found.values()].every((x) => x.lowImpact) && !h.envAdds.length) return warn('SEC-04', evidence, { question: 'Only test-mode keys were found in history. Confirm they are test keys.' });
+    if ([...h.found.values()].every((x) => x.lowImpact) && !h.envAdds.length) return warn('SEC-04', evidence, { question: 'Only test-mode or local-dev keys, or keys in test files, were found in history. Confirm none of them was ever a real key.' });
     return fail('SEC-04', evidence);
   }
-  return pass('SEC-04', [`Scanned the last ${h.commits} commit(s) touching this directory: no high-confidence secrets in added lines and no committed env files.${h.truncated ? ' (stopped early on the time/size budget)' : ''}`]);
+  return pass('SEC-04', [`Scanned the last ${h.commits} commit(s) touching this directory: no high-confidence secrets in added lines and no committed env files.${h.truncated ? ' (stopped early on the time/size budget)' : ''}`, ...evidence.filter((e) => e.startsWith('Shallow clone'))]);
 }
 
 // ── SEC-05 ─────────────────────────────────────────────────────────────────
@@ -343,14 +359,15 @@ function bundleSecrets(repo) {
 function jwtSecrets(repo, claimed) {
   const hits = [];
   const seen = new Set();
-  const add = (f, index, note) => {
+  const add = (f, index, note, value = null) => {
     const line = repo.lineOf(f, index);
+    repo.noteSecret(value);
     if (repo.suppressed(f, line) || seen.has(`${f.rel}:${line}`)) return;
     seen.add(`${f.rel}:${line}`);
     claimed.add(`${f.rel}:${line}`);
     hits.push(ev(f.rel, line, note, repo.snippet(f, line)));
   };
-  const bad = (v) => !/^\$\{|process\.env|import\.meta|Deno\.env/.test(v) && !v.includes('${');
+  const bad = (v) => !/^\$\{|^env\(|process\.env|import\.meta|Deno\.env/.test(v) && !v.includes('${');
   const files = repo.files.filter((f) => !f.build && (f.kind === 'code' || f.kind === 'config') && !repo.isTest(f) && !localOnly(repo, f));
   for (const f of files) {
     const text = repo.code(f);
@@ -359,27 +376,27 @@ function jwtSecrets(repo, claimed) {
       const literalDefs = new Map();
       for (const m of text.matchAll(SECRET_CONST_RE)) {
         literalDefs.set(m[1], { index: m.index, value: m[3] });
-        if (SECRET_CONST_NAME_RE.test(m[1]) && bad(m[3])) add(f, m.index, `signing secret "${m[1]}" is a string literal`);
+        if (SECRET_CONST_NAME_RE.test(m[1]) && bad(m[3])) add(f, m.index, `signing secret "${m[1]}" is a string literal`, m[3]);
       }
       for (const m of text.matchAll(JWT_CALL_RE)) {
         const call = splitArgs(text, m.index + m[0].length - 1);
         if (!call || call.args.length < 2) continue;
         const secretArg = call.args[1].text;
         const lit = literalValue(secretArg);
-        if (lit !== null && bad(lit)) add(f, call.args[1].start, `jwt.${m[1]}() uses a string literal as the secret`);
+        if (lit !== null && bad(lit)) add(f, call.args[1].start, `jwt.${m[1]}() uses a string literal as the secret`, lit);
         else if (/^[A-Za-z_$][\w$]*$/.test(secretArg) && literalDefs.has(secretArg) && bad(literalDefs.get(secretArg).value)) {
-          add(f, literalDefs.get(secretArg).index, `jwt.${m[1]}() secret "${secretArg}" is a string literal`);
+          add(f, literalDefs.get(secretArg).index, `jwt.${m[1]}() secret "${secretArg}" is a string literal`, literalDefs.get(secretArg).value);
         }
       }
-      for (const m of text.matchAll(ENV_FALLBACK_RE)) add(f, m.index, `${m[1]} falls back to a hardcoded string when the env var is missing`);
+      for (const m of text.matchAll(ENV_FALLBACK_RE)) add(f, m.index, `${m[1]} falls back to a hardcoded string when the env var is missing`, m[3]);
       if (SESSION_LIB_RE.test(text)) {
-        for (const m of text.matchAll(LIB_SECRET_RE)) if (bad(m[3])) add(f, m.index, `session/JWT library "${m[1]}" is a string literal`);
-        if (/iron-session|getIronSession|sealData/.test(text)) for (const m of text.matchAll(IRON_PASSWORD_RE)) if (bad(m[2])) add(f, m.index, 'iron-session password is a string literal');
-        if (/cookie-session/.test(text)) for (const m of text.matchAll(COOKIE_KEYS_RE)) if (bad(m[2])) add(f, m.index, 'cookie-session signing key is a string literal');
-        if (/\bjose\b|SignJWT|jwtVerify/.test(text)) for (const m of text.matchAll(JOSE_LITERAL_RE)) if (bad(m[2])) add(f, m.index, 'jose signing key is encoded from a string literal');
+        for (const m of text.matchAll(LIB_SECRET_RE)) if (bad(m[3])) add(f, m.index, `session/JWT library "${m[1]}" is a string literal`, m[3]);
+        if (/iron-session|getIronSession|sealData/.test(text)) for (const m of text.matchAll(IRON_PASSWORD_RE)) if (bad(m[2])) add(f, m.index, 'iron-session password is a string literal', m[2]);
+        if (/cookie-session/.test(text)) for (const m of text.matchAll(COOKIE_KEYS_RE)) if (bad(m[2])) add(f, m.index, 'cookie-session signing key is a string literal', m[2]);
+        if (/\bjose\b|SignJWT|jwtVerify/.test(text)) for (const m of text.matchAll(JOSE_LITERAL_RE)) if (bad(m[2])) add(f, m.index, 'jose signing key is encoded from a string literal', m[2]);
       }
     } else if (/(?:^|\/)(?:config|settings)[^/]*\.(?:json|ya?ml|toml)$|(?:^|\/)config\//.test(f.rel)) {
-      for (const m of text.matchAll(CONFIG_SECRET_RE)) if (bad(m[2]) && !P.isPlaceholder(m[2])) add(f, m.index, `"${m[1]}" is set in a committed config file`);
+      for (const m of text.matchAll(CONFIG_SECRET_RE)) if (bad(m[2]) && !P.isPlaceholder(m[2])) add(f, m.index, `"${m[1]}" is set in a committed config file`, m[2]);
     }
   }
   if (hits.length) return fail('SEC-06', hits);

@@ -8,7 +8,7 @@
  */
 
 const { loadRepo } = require('../lib/repo');
-const { getRoutes, segments, routeBody } = require('../lib/routes');
+const { getRoutes, segments, routeBody, fileHelpers } = require('../lib/routes');
 const { AUTH_RE, ROLE_RE } = require('../lib/primitives');
 const net = require('../lib/net');
 const { pass, fail, warn, manual, na, ev } = require('../lib/result');
@@ -19,12 +19,16 @@ const IDS = ['AUTH-01', 'AUTH-02', 'AUTH-03', 'AUTH-04', 'AUTH-05', 'AUTH-06', '
 
 // Routes that are public by design (auth flows, webhooks with signatures, health checks, public forms).
 const PUBLIC_PATH_RE = /(?:^|\/)(?:login|log-in|logout|signin|sign-in|signup|sign-up|register|join|auth|oauth|callback|forgot[\w-]*|reset[\w-]*|verify[\w-]*|confirm[\w-]*|magic[\w-]*|otp|webhooks?|[\w-]*webhook[\w-]*|health|healthz|status|ping|ready|version|robots\.txt|sitemap[\w.]*|og|contact|subscribe|newsletter|waitlist|unsubscribe|csp-report|cron)(?:\/|$|\.)/i;
+// Server actions and functions are named, not pathed: action:login, fn:subscribeNewsletter.
+const PUBLIC_NAME_RE = /log_?in|log_?out|sign_?in|sign_?up|sign_?out|register|forgot|reset|verify|confirm|magic|otp|webhook|newsletter|waitlist|contact|oauth|callback|health|ping/i;
+const isPublicPath = (p) => PUBLIC_PATH_RE.test(p) || (/^(?:action|fn):/.test(p) && PUBLIC_NAME_RE.test(p.slice(p.indexOf(':') + 1)));
 const SENSITIVE_GET_RE = /(?:^|\/)(?:users?|me|account|accounts|admin|orders?|payments?|invoices?|billing|profiles?|messages?|settings|customers?|notes|documents|files|exports?|reports?|subscriptions?|transactions?|conversations?|chats?)(?:\/|$)/i;
+const BATCH_PATH_RE = /(?:^|\/)(?:cron|crons|jobs?|tasks?|workers?|queues?|scheduled)(?:\/|$)/i;
 const ADMIN_PATH_RE = /(?:^|\/)(?:admin|internal|staff|superuser|super-admin|backoffice|back-office|moderation|moderator|ops)(?:\/|$)/i;
 const MANAGED_AUTH_RE = /\bsupabase\.auth\.|\.auth\.(?:getUser|getSession|signInWith\w+|signUp)\b|@clerk\/|next-auth|@auth\/|firebase\/auth|firebase-admin\/auth|getAuth\(|@auth0\/|better-auth|\blucia\b|@kinde-oss\/|@workos-inc\/|@stackframe\/|@descope\/|supertokens|aws-amplify|@stytch\//;
 const USER_OWNED_TABLES = new Set(['users', 'profiles', 'accounts', 'orders', 'payments', 'invoices', 'messages', 'notes', 'todos', 'documents', 'files', 'subscriptions', 'carts', 'addresses', 'transactions', 'conversations', 'chats', 'bookings', 'appointments', 'tickets', 'uploads']);
 // Strict ownership predicates (stronger than "references the user somewhere").
-const OWNERSHIP_RE = /\.eq\(\s*['"`](?:user_?id|owner_?id|author_?id|created_?by|profile_?id|customer_?id|member_?id)['"`]|\b(?:userId|ownerId|authorId|user_id|owner_id|author_id|createdBy|created_by|customerId)\s*:\s*(?:req\.user|session|user|ctx|locals|auth|currentUser|claims)|\bAND\s+"?(?:user_id|owner_id|author_id|created_by)"?\s*=|\b(?:WHERE)\s+"?(?:user_id|owner_id|author_id|created_by)"?\s*=|\.(?:user_?id|owner_?id|author_?id|userId|ownerId)\s*[!=]==?\s*(?:req\.user|session\.user|user|currentUser)\??\.id|auth\.uid\(\)|\buserClient\(|\bcreateServerClient\(|\bcreateRouteHandlerClient\(|\bcreateServerComponentClient\(/;
+const OWNERSHIP_RE = /\.eq\(\s*['"`](?:user_?id|owner_?id|author_?id|created_?by|profile_?id|customer_?id|member_?id)['"`]|\b(?:userId|ownerId|authorId|user_id|owner_id|author_id|createdBy|created_by|customerId)\s*:\s*(?:req\.(?:user|session|auth)|session|user|ctx|locals|auth|currentUser|claims)|\bAND\s+"?(?:user_id|owner_id|author_id|created_by)"?\s*=|\b(?:WHERE)\s+"?(?:user_id|owner_id|author_id|created_by)"?\s*=|\.(?:user_?id|owner_?id|author_?id|userId|ownerId)\s*[!=]==?\s*(?:req\.user|(?:req\.)?session\??\.user|user|currentUser)\??\.id|auth\.uid\(\)|\buserClient\(|\bcreateServerClient\(|\bcreateRouteHandlerClient\(|\bcreateServerComponentClient\(/;
 
 async function run(root, opts = {}) {
   const repo = loadRepo(root, opts);
@@ -56,7 +60,8 @@ function weakAuth({ repo, server, routes }) {
   let customAuth = false;
   const rules = [
     { re: /createHash\(\s*['"`](md5|sha1|sha256|sha512)['"`]\s*\)\s*\.update\(\s*([^)]*)\)/g, test: (m) => /pass(?:word)?|pwd/i.test(m[2]), note: (m) => `password hashed with fast unsalted ${m[1]}`, list: bad },
-    { re: /\b\w+\??\.(?:password|passwd|pwd)\s*(?:===?|!==?)\s*[\w.]+/g, test: (m) => !/confirm|repeat|again/i.test(m[0]), note: () => 'password compared as plaintext, so passwords are stored unhashed', list: bad },
+    // decrypted integration credentials (CalDAV, SMTP app passwords) are compared in plaintext by design
+    { re: /\b(\w+)\??\.(?:password|passwd|pwd)\s*(?:===?|!==?)\s*[\w.]+/g, test: (m) => !/confirm|repeat|again/i.test(m[0]) && !/decrypt|credential|integration|caldav|smtp|imap|config|settings|options|env/i.test(m[1]), note: () => 'password compared as plaintext, so passwords are stored unhashed', list: bad },
     { re: /\b(?:password|passwd|pwd)\s*(?:===?|!==?)\s*\w+\??\.(?:password|passwd|pwd)\b/g, test: () => true, note: () => 'password compared as plaintext, so passwords are stored unhashed', list: bad },
     { re: /\bbcrypt(?:js)?\.(?:hash|hashSync)\(\s*[^,]+,\s*([0-9]+)\s*\)|\bgenSalt(?:Sync)?\(\s*([0-9]+)\s*\)/g, test: (m) => Number(m[1] || m[2]) < 10, note: (m) => `bcrypt cost ${m[1] || m[2]} is below 10`, list: soft },
     { re: /\bpassword[\w.]*\.length\s*<\s*([1-7])\b/gi, test: () => true, note: (m) => `passwords as short as ${m[1]} characters are accepted`, list: soft },
@@ -94,7 +99,7 @@ function missingAuthz(ctx) {
   const open = [];
   let considered = 0;
   for (const r of routes) {
-    if (PUBLIC_PATH_RE.test(r.path)) continue;
+    if (isPublicPath(r.path)) continue;
     const sensitiveGet = (r.method === 'GET' || r.method === 'HEAD') && SENSITIVE_GET_RE.test(r.path);
     if (!isWrite(r) && !sensitiveGet) continue;
     considered++;
@@ -129,7 +134,8 @@ function crossUser(ctx) {
   const owned = userOwnedTables(repo);
   const hits = [];
   for (const r of routes) {
-    for (const seg of segments(r)) {
+    if (BATCH_PATH_RE.test(r.path) || ADMIN_PATH_RE.test(r.path)) continue; // cron jobs and admin tools list everything by design (AUTH-04 covers admin auth)
+    for (const seg of segments(r, { helpers: false })) {
     const t = seg.text;
     // Supabase: <client>.from('t').select(…) chains with no owner filter, run with an RLS-bypassing client.
     for (const m of t.matchAll(/\b(\w+)(?:\([^)]*\))?\s*\.from\(\s*['"`](\w+)['"`]\s*\)\s*\.select\(([^)]*)\)((?:\s*\.\s*\w+\([^)]*\))*)/g)) {
@@ -180,15 +186,12 @@ function adminRoutes(ctx) {
     else bad.push(ev(r.file.rel, r.line, `${routeLabel(r)} has no authentication or role check anywhere in its chain`, repo.snippet(r.file, r.line)));
   }
   // Admin pages: protection has to happen on the server, not in a client redirect.
-  for (const f of repo.sources({ kinds: ['code'], tests: false, js: true })) {
-    if (!/(?:^|\/)(?:app|pages|routes|src\/pages|src\/routes|src\/app)\/(?:\([^)]*\)\/)?admin(?:\/|\.|$)|(?:^|\/)Admin[\w]*\.(?:jsx|tsx|vue|svelte)$/.test(f.rel)) continue;
-    if (/(?:^|\/)api\//.test(f.rel) || /route\.[cm]?[jt]s$|\+server\./.test(f.rel)) continue;
-    const uiFile = /\.(?:jsx|tsx|vue|svelte|astro)$/.test(f.rel) || /(?:^|\/)page\.[cm]?[jt]sx?$/.test(f.rel);
-    if (!uiFile || repo.side(f) === 'server') continue; // routers are covered above; this is for UI pages
+  for (const page of adminPages(repo)) {
     found++;
-    const text = repo.code(f) || '';
-    const serverGuard = repo.side(f) !== 'client' && (ROLE_RE.test(text) || AUTH_RE.test(text));
-    const mwGuard = nextMiddleware && nextMiddleware.auth && nextMiddleware.covers('/admin');
+    const f = page.file;
+    const guardFiles = [f, ...page.guards];
+    const serverGuard = guardFiles.some((g) => repo.side(g) !== 'client' && guarded(repo, g));
+    const mwGuard = nextMiddleware && nextMiddleware.auth && nextMiddleware.covers(page.path);
     if (serverGuard || mwGuard) continue;
     soft.push(ev(f.rel, 1, repo.side(f) === 'client' ? 'admin page is a client component: any redirect here is cosmetic, so the server routes it calls must check the admin role' : 'admin page with no server-side role check'));
   }
@@ -198,7 +201,58 @@ function adminRoutes(ctx) {
   return pass('AUTH-04', [`${found} admin route(s)/page(s) found, each behind a server-side role check.`]);
 }
 
+// Routing directories whose files are pages; components, emails and helpers elsewhere are not.
+const PAGE_DIR_RE = /(?:^|\/)(?:src\/)?(?:app|pages|routes|views|screens)\//;
+const UI_EXT_RE = /\.(?:jsx|tsx|js|ts|mjs|vue|svelte|astro)$/;
+
+/** Admin pages (UI route files under an admin segment) with the server files that can guard them. */
+function adminPages(repo) {
+  const out = [];
+  const files = repo.sources({ kinds: ['code'], tests: false, js: true });
+  const byRel = new Set(files.map((f) => f.rel));
+  for (const f of files) {
+    const m = PAGE_DIR_RE.exec(f.rel);
+    if (!m || !UI_EXT_RE.test(f.rel)) continue;
+    const routePart = f.rel.slice(m.index + m[0].length);
+    const segs = routePart.split('/');
+    // admin, (admin) route groups, admin.users (Remix flat routes), AdminDashboard.tsx; not administration/adminer
+    if (!segs.some((x) => /^[aA]dmin(?:[^a-z]|$)/.test(x.replace(/^[+_]/, '').replace(/^\((.*)\)$/, '$1')))) continue;
+    const base = segs[segs.length - 1];
+    const dir = f.rel.slice(0, f.rel.lastIndexOf('/'));
+    const nextApp = /(?:^|\/)(?:src\/)?app\//.test(f.rel) && repo.depsFor(f.rel).has('next');
+    if (/(?:^|\/)api\//.test(routePart) || /^route\.|^\+server\./.test(base) || /^_(?!admin)|\.d\.ts$|\.(?:test|spec|stories)\./.test(base)) continue;
+    if (nextApp && !/^page\.[cm]?[jt]sx?$/.test(base)) continue; // app router: only page files are routes
+    if (/^\+/.test(base) && !/^\+page\.svelte$/.test(base)) continue; // SvelteKit: the page, guarded by its server files
+    if (!nextApp && !/^\+/.test(base) && repo.side(f) === 'server' && !/\.(?:jsx|tsx|vue|svelte|astro)$/.test(base)) continue; // routers: covered by the route check
+    const guards = [];
+    // ancestor layouts (Next app router, Remix parent routes) and SvelteKit server load files
+    const parts = dir.split('/');
+    for (let i = parts.length; i > 0; i--) {
+      const d = parts.slice(0, i).join('/');
+      for (const name of ['layout.tsx', 'layout.jsx', 'layout.ts', 'layout.js', '+layout.server.ts', '+layout.server.js', '+page.server.ts', '+page.server.js', '+layout.ts', '+layout.js']) {
+        if (byRel.has(`${d}/${name}`)) guards.push(repo.get(`${d}/${name}`));
+      }
+      if (d.endsWith('/app') || d === 'app' || d.endsWith('/routes') || d === 'routes') break;
+    }
+    for (const hook of ['src/hooks.server.ts', 'src/hooks.server.js']) if (byRel.has(hook)) guards.push(repo.get(hook));
+    const routePath = `/${routePart.replace(/\/(?:page|\+page|index)\.[\w]+$|\.[\w]+$/, '').replace(/\([^)]*\)\//g, '')}`;
+    out.push({ file: f, guards, path: routePath });
+  }
+  return out;
+}
+
+/** Does this file (or a helper it calls, one import hop away) check auth or the admin role? */
+function guarded(repo, f) {
+  const text = repo.code(f) || '';
+  if (ROLE_RE.test(text) || AUTH_RE.test(text)) return true;
+  return fileHelpers(repo, f).some((h) => ROLE_RE.test(h.text) || AUTH_RE.test(h.text));
+}
+
 // ── AUTH-05 ────────────────────────────────────────────────────────────────
+
+const FLAG_NAME_RE = /^(?:is|has|should|can|was|did|created|updated|sent|last)[A-Z_]|[vV]alid|[eE]xpir/;
+const TIMESTAMP_NAME_RE = /(?:[a-z0-9](?:Time|Timestamp|Date|Until|Count|Attempts?|Length|At|Ttl|TTL|Age|Exp)|_(?:time|timestamp|date|until|count|attempts?|length|at|ttl|age|exp))$/;
+const EXPIRY_RE = /expir|ttl|valid_?until|validUntil|maxAge|max_age|\.add\(\s*\d|Date\.now\(\)\s*\+|\+\s*Date\.now\(\)|\bsetex\b|['"]EX['"]|\bexp\s*:|\binterval\s+'|\bmoment\(\)\.add|dayjs\(\)\.add|addMinutes|addHours/i;
 
 function passwordReset({ repo, server, routes }) {
   const bad = [];
@@ -210,11 +264,16 @@ function passwordReset({ repo, server, routes }) {
     const text = repo.code(f) || '';
     if (/resetPasswordForEmail|sendPasswordResetEmail|\bforgotPassword\(\s*\{|resetPassword\(\s*\{|@clerk\//.test(text)) managed = true;
     const resetCtx = resetFiles.has(f.rel) || /reset_?token|resetPasswordToken|passwordResetToken|forgot.?password/i.test(text);
-    for (const m of text.matchAll(/\b(?:const|let|var)\s+(\w*(?:token|code|otp|secret|reset|nonce|salt|pin|invite|verification)\w*)\s*=\s*[^;\n]*\b(Math\.random\(\)|Date\.now\(\))/gi)) {
+    for (const m of text.matchAll(/\b(?:const|let|var)\s+(\w*(?:token|code|otp|secret|reset|nonce|salt|pin|invite|verification)\w*)\s*=\s*([^;\n]*)\b(Math\.random\(\)|Date\.now\(\))([^;\n]*)/gi)) {
+      // isTokenValid, tokenExpiresAt, codeTtl… are flags and timestamps, not tokens
+      if (FLAG_NAME_RE.test(m[1]) || TIMESTAMP_NAME_RE.test(m[1])) continue;
+      const expr = `${m[2]}${m[3]}${m[4]}`;
+      if (/[<>]=?|===?|!==?/.test(expr)) continue; // comparisons
+      if (m[3] === 'Date.now()' && /Date\.now\(\)\s*[+-]\s*[\d(A-Z]|[\d)]\s*[+-]\s*Date\.now\(\)|new Date\(/.test(expr)) continue; // expiry arithmetic
       const line = repo.lineOf(f, m.index);
       if (repo.suppressed(f, line)) continue;
       custom = true;
-      bad.push(ev(f.rel, line, `"${m[1]}" is generated with ${m[2]}, which is predictable`, repo.snippet(f, line)));
+      bad.push(ev(f.rel, line, `"${m[1]}" is generated with ${m[3]}, which is predictable`, repo.snippet(f, line)));
     }
     if (!resetCtx) continue;
     custom = true;
@@ -222,11 +281,11 @@ function passwordReset({ repo, server, routes }) {
       const line = repo.lineOf(f, m.index);
       soft.push(ev(f.rel, line, 'reset link is built from the request Host header (an attacker can point it at their domain)', repo.snippet(f, line)));
     }
-    for (const m of text.matchAll(/['"`][^'"`\n]*(?:user not found|no user|not registered|does not exist|doesn't exist|no account|unknown email)[^'"`\n]*['"`]/gi)) {
+    for (const m of /(?:^|\/)admin\//i.test(f.rel) ? [] : text.matchAll(/['"`][^'"`\n]*(?:user not found|no user|not registered|does not exist|doesn't exist|no account|unknown email)[^'"`\n]*['"`]/gi)) {
       const line = repo.lineOf(f, m.index);
       soft.push(ev(f.rel, line, 'reset flow tells callers whether an email is registered (user enumeration)', repo.snippet(f, line)));
     }
-    if (/reset_?token|resetPasswordToken|passwordResetToken/i.test(text) && !/expir|ttl|valid_?until|validUntil/i.test(text)) {
+    if (/reset_?token|resetPasswordToken|passwordResetToken/i.test(text) && !EXPIRY_RE.test(text)) {
       const idx = text.search(/reset_?token|resetPasswordToken|passwordResetToken/i);
       soft.push(ev(f.rel, repo.lineOf(f, idx), 'reset tokens are stored with no expiry', repo.snippet(f, repo.lineOf(f, idx))));
     }
@@ -258,10 +317,11 @@ function sessions({ repo, server }) {
     for (const m of text.matchAll(/\b(?:jwt|jsonwebtoken)\.sign\(/g)) {
       const call = splitArgs(text, m.index + m[0].length - 1);
       if (!call) continue;
-      const optsArg = call.args[2] ? call.args[2].text : '';
-      const payload = call.args[0] ? call.args[0].text : '';
+      const optsArg = call.args[2] ? definitionOf(text, call.args[2].text) : '';
+      if (optsArg === null) continue; // options built elsewhere: can't tell
+      const payload = definitionOf(text, call.args[0] ? call.args[0].text : '') || '';
       const exp = /expiresIn\s*:\s*(['"`]?)(\d+)\s*([a-z]*)\1/i.exec(optsArg);
-      if (!/expiresIn/.test(optsArg) && !/\bexp\s*:/.test(payload)) add(soft, m.index, 'jwt.sign() sets no expiresIn: these tokens never expire');
+      if (!/expiresIn/.test(optsArg) && !/\bexp\b\s*[:,}]/.test(payload)) add(soft, m.index, 'jwt.sign() sets no expiresIn: these tokens never expire');
       else if (exp) {
         const n = Number(exp[2]);
         const unit = (exp[3] || 's').toLowerCase();
@@ -291,6 +351,42 @@ function sessions({ repo, server }) {
   return pass('AUTH-06', ['JWTs are verified and expire; no tokens in localStorage; sessions use a persistent store.']);
 }
 
+/**
+ * Text of an argument: object literals as-is; an identifier resolves to its object-literal
+ * definition in the same file (spreads of other local objects inlined). Returns null when the
+ * value is built elsewhere (an import, a function result) so callers can give it the benefit of the doubt.
+ */
+function definitionOf(text, arg, depth = 0) {
+  if (!arg) return '';
+  if (/^\{/.test(arg)) {
+    if (depth > 2) return arg;
+    let out = arg;
+    for (const m of arg.matchAll(/\.\.\.\s*([A-Za-z_$][\w$]*)/g)) {
+      const inner = definitionOf(text, m[1], depth + 1);
+      if (inner === null) return null;
+      out += `\n${inner}`;
+    }
+    return out;
+  }
+  if (!/^[A-Za-z_$][\w$]*$/.test(arg)) return null;
+  const def = new RegExp(`\\b(?:const|let|var)\\s+${arg}\\s*(?::[^=]{1,200})?=\\s*\\{`).exec(text);
+  if (!def) return null;
+  const open = def.index + def[0].length - 1;
+  const body = splitBraces(text, open);
+  return body === null ? null : definitionOf(text, body, depth + 1);
+}
+
+/** The balanced {…} starting at `open`, or null. */
+function splitBraces(text, open) {
+  let depth = 0;
+  for (let i = open; i < Math.min(text.length, open + 4000); i++) {
+    const ch = text[i];
+    if (ch === '{') depth++;
+    else if (ch === '}' && --depth === 0) return text.slice(open, i + 1);
+  }
+  return null;
+}
+
 // ── AUTH-07 ────────────────────────────────────────────────────────────────
 
 function idor(ctx) {
@@ -307,7 +403,7 @@ function idor(ctx) {
   ];
   for (const r of routes) {
     if (OWNERSHIP_RE.test(routeBody(r)) || ROLE_RE.test(chain(r))) continue;
-    for (const seg of segments(r)) {
+    for (const seg of segments(r, { helpers: false })) {
       for (const re of lookups) {
         for (const m of seg.text.matchAll(re)) {
           const arg = m[2] || m[1];
@@ -405,18 +501,22 @@ async function cookies(ctx) {
     for (const m of text.matchAll(calls)) {
       const call = splitArgs(text, m.index + m[0].lastIndexOf('('));
       if (!call || !call.args.length) continue;
+      // a helper's own definition (function setCookie(res, token) {…}) is not a call
+      if (/\bfunction\s*$/.test(text.slice(Math.max(0, m.index - 12), m.index)) || /^\s*(?::[^={;]{1,200})?(?:\{|=>)/.test(text.slice(call.end + 1, call.end + 210))) continue;
       any = true;
       const line = repo.lineOf(f, m.index);
       if (repo.suppressed(f, line)) continue;
       const args = call.args.map((a) => a.text);
       const single = args.length === 1 && args[0].startsWith('{');
       const name = single ? (/\bname\s*:\s*['"`]([^'"`]+)/.exec(args[0]) || [])[1] || '' : literalValue(args[0]) || args[0];
-      const options = single ? args[0] : args.slice(2).find((a) => a.startsWith('{')) || '';
+      const options = definitionOf(text, single ? args[0] : args[2] || '');
+      if (options === null) continue; // options come from elsewhere: can't tell
       const valueArg = single ? (/\bvalue\s*:\s*([^,}]+)/.exec(args[0]) || [])[1] || '' : args[1] || '';
       if (!AUTHISH_COOKIE_RE.test(name) && !/token|jwt|session/i.test(valueArg)) continue;
-      const httpOnly = /httpOnly\s*:\s*true/i.test(options) || (svelte && !/httpOnly\s*:\s*false/i.test(options));
-      const secure = /\bsecure\s*:\s*(?:true|process\.env|!dev|isProd|prod)/i.test(options) || (svelte && !/\bsecure\s*:\s*false/i.test(options));
-      const sameSite = /sameSite\s*:\s*['"`]?(?:lax|strict)/i.test(options) || (svelte && !/sameSite\s*:\s*['"`]?none/i.test(options));
+      // shorthand ({ httpOnly, secure }) and computed values get the benefit of the doubt
+      const httpOnly = /httpOnly\s*:\s*(?!false\b)[\w!(]/i.test(options) || /[{,]\s*httpOnly\s*[,}]/i.test(options) || (svelte && !/httpOnly\s*:\s*false/i.test(options));
+      const secure = /\bsecure\s*:\s*(?!false\b)[\w!(]/i.test(options) || /[{,]\s*secure\s*[,}]/i.test(options) || (svelte && !/\bsecure\s*:\s*false/i.test(options));
+      const sameSite = /sameSite\s*:\s*(?:['"`]?(?:lax|strict)|(?!['"`]|none\b)[\w(])/i.test(options) || /[{,]\s*sameSite\s*[,}]/i.test(options) || (svelte && !/sameSite\s*:\s*['"`]?none/i.test(options));
       const missing = [!httpOnly && 'HttpOnly', !secure && 'Secure', !sameSite && 'SameSite'].filter(Boolean);
       if (!missing.length) continue;
       (missing.includes('HttpOnly') ? bad : soft).push(ev(f.rel, line, `auth cookie "${name}" is set without ${missing.join(', ')}`, repo.snippet(f, line)));
@@ -456,4 +556,4 @@ async function cookies(ctx) {
   return pass('AUTH-10', ['Auth/session cookies are set with HttpOnly, Secure and SameSite.']);
 }
 
-module.exports = { name: 'auth', ids: IDS, run, PUBLIC_PATH_RE, isProtected };
+module.exports = { name: 'auth', ids: IDS, run, PUBLIC_PATH_RE, isPublicPath, isProtected };

@@ -48,7 +48,7 @@ function collector(repo) {
 }
 
 const result = (id, hits, okText) => (hits.length ? warn(id, hits) : pass(id, [okText]));
-const sanitizedVar = (text, name) => new RegExp(`\\b${name.replace(/[$]/g, '\\$')}\\s*=\\s*[^;\\n]*${SANITIZER_RE.source}`).test(text);
+const sanitizedVar = (text, name) => new RegExp(`\\b${name.replace(/[$]/g, '\\$')}\\s*=\\s*[^;\\n]*(?:${SANITIZER_RE.source})`).test(text);
 
 // ── APP-01 ─────────────────────────────────────────────────────────────────
 
@@ -57,10 +57,14 @@ function xss({ repo, all, tainted }) {
   for (const f of all) {
     const text = repo.code(f) || '';
     const dynamic = (expr) => {
-      const e = expr.trim();
+      const e = expr.trim().replace(/,$/, '').trim();
       if (literalValue(e) !== null || /^['"`]\s*['"`]$/.test(e)) return false;
       if (SANITIZER_RE.test(e)) return false;
       if (/^[A-Za-z_$][\w$]*$/.test(e) && sanitizedVar(text, e)) return false;
+      // props.safeBio, descriptionAsSafeHtml, escapedTitle: named as already sanitized
+      if (/^[\w$.?]+$/.test(e) && /(?:^|[.?])[\w$]*(?:[sS]afe|[sS]anitized|[eE]scaped|[pP]urified)[\w$]*$/.test(e)) return false;
+      // templates that only interpolate constants (`…${GTM_ID}…`, `${process.env.X}`)
+      if (e.startsWith('`') && interpolations(e).every((x) => /^(?:[A-Z][A-Z0-9_]*|process\.env\.\w+|import\.meta\.env\.\w+|\d+)$/.test(x))) return false;
       return true;
     };
     for (const m of text.matchAll(/dangerouslySetInnerHTML\s*=\s*\{\s*\{\s*__html\s*:\s*([\s\S]*?)\}\s*\}/g)) if (dynamic(m[1])) c.add(f, m.index, `dangerouslySetInnerHTML renders ${m[1].trim().slice(0, 40)} without a sanitizer`);
@@ -103,6 +107,7 @@ function sqli({ repo, server, tainted }) {
       if (!SQL_KEYWORD_RE.test(sql.replace(/^\(+/, ''))) continue;
       if (!isDynamicString(sql)) continue;
       const userData = isTainted(sql, names);
+      if (!userData && sql.startsWith('`') && interpolations(sql).every((e) => safeInterpolation(e, defs))) continue;
       c.add(f, at, `SQL built with ${sql.startsWith('`') ? 'a template literal' : 'string concatenation'}${userData ? ' from request data' : ''}`);
     }
     for (const m of text.matchAll(/\.(?:or|filter|textSearch|match)\(\s*`[^`]*\$\{([^}]+)\}/g)) if (isTainted(m[1], names)) c.add(f, m.index, 'PostgREST filter string interpolates request data (filter injection)');
@@ -112,6 +117,39 @@ function sqli({ repo, server, tainted }) {
     for (const m of text.matchAll(/\.execute\(\s*(?:f["']|["'][^"'\n]*["']\s*%|["'][^"'\n]*["']\s*\.format\(|["'][^"'\n]*["']\s*\+)/g)) c.add(f, m.index, 'SQL built with an f-string, % or .format()');
   }
   return result('APP-02', c.hits, 'No SQL built from template literals or string concatenation found; queries use parameters or tagged templates.');
+}
+
+/** The ${…} expressions of a template literal (top level, nested braces balanced). */
+function interpolations(tpl) {
+  const out = [];
+  for (let i = tpl.indexOf('${'); i !== -1; i = tpl.indexOf('${', i + 1)) {
+    let depth = 0;
+    for (let j = i + 1; j < tpl.length; j++) {
+      if (tpl[j] === '{') depth++;
+      else if (tpl[j] === '}' && --depth === 0) {
+        out.push(tpl.slice(i + 2, j).trim());
+        i = j;
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Interpolations that can't carry user text: numbers, constants, placeholder lists ($1, $2…)
+ * and identifiers defined in the same file as literals or placeholder builders.
+ */
+function safeInterpolation(expr, defs, depth = 0) {
+  if (/^(?:Number|parseInt|parseFloat|Math\.\w+)\s*\(|^\d+$|^[A-Z][A-Z0-9_]*(?:\.[A-Z][A-Z0-9_]*)*$/.test(expr)) return true;
+  if (/\$\$\{|['"`]\$['"`]\s*\+|placeholder/i.test(expr)) return true;
+  if (/^[A-Za-z_$][\w$]*$/.test(expr) && defs.has(expr) && depth < 2) {
+    const rhs = defs.get(expr).rhs.trim();
+    if (literalValue(rhs) !== null || /^\d+$/.test(rhs) || /\$\$\{|['"`]\$['"`]\s*\+/.test(rhs)) return true;
+    if (rhs.startsWith('`')) return interpolations(rhs).every((e) => safeInterpolation(e, defs, depth + 1));
+    if (/^\w+\s*\?\s*(['"`])[^'"`]*\1\s*:\s*(['"`])[^'"`]*\2$/.test(rhs)) return true; // asc ? 'ASC' : 'DESC'
+  }
+  return false;
 }
 
 // ── APP-03 ─────────────────────────────────────────────────────────────────
@@ -141,6 +179,9 @@ function nosqli({ repo, server, tainted }) {
 
 const FETCH_RE = /(?<![\w.$])(?:fetch|axios(?:\.(?:get|post|put|patch|delete|head|request))?|got(?:\.(?:get|post|stream))?|ky(?:\.(?:get|post))?|needle|superagent\.(?:get|post)|request(?:\.(?:get|post))?|https?\.(?:get|request)|undici\.request|\$fetch|ofetch)\s*\(/g;
 
+// A host allowlist or URL validator ahead of the request.
+const SSRF_GUARD_RE = /\b(?:is|validate|check|assert|ensure|verify)\w*(?:Url|URL|Uri|URI|Host|Hostname|Domain|Allowed|Safe|Origin|Ssrf|SSRF)\w*\s*\(|\b(?:allow|white|safe)[_-]?list\w*\.(?:includes|has|some)\(|\b(?:ALLOWED|allowed)\w*\.(?:includes|has|some)\(|\.(?:hostname|host|origin)\s*(?:!==|===|!=|==)|ssrf-req-filter|request-filtering-agent|\bipaddr\.|\bisPrivate(?:IP|Ip|Address)?\s*\(/;
+
 function ssrf({ repo, server, tainted }) {
   const c = collector(repo);
   for (const f of server) {
@@ -158,7 +199,10 @@ function ssrf({ repo, server, tainted }) {
         if (/^[a-z][a-z0-9+.-]*:\/\/[^/$]+\//i.test(prefix) || /^\//.test(prefix)) continue; // host pinned (or relative)
       }
       if (/^[A-Z_][A-Z0-9_]*\s*\+/.test(url) || /^process\.env\.\w+\s*\+/.test(url)) continue; // BASE_URL + path
-      if (isTainted(url, names)) c.add(f, m.index, `server-side request to a URL from request data (${url.slice(0, 40)})`);
+      if (/^`\$\{\s*(?:[A-Z][A-Z0-9_]*|process\.env\.\w+|(?:env|config)\.\w+)\s*\}\//.test(url)) continue; // `${BASE_URL}/path`: host pinned
+      if (!isTainted(url, names)) continue;
+      if (SSRF_GUARD_RE.test(text.slice(Math.max(0, m.index - 2000), m.index))) continue; // allowlist / URL validator before the call
+      c.add(f, m.index, `server-side request to a URL from request data (${url.slice(0, 40)})`);
     }
   }
   return result('APP-05', c.hits, 'No server-side fetches to request-controlled URLs found.');
@@ -240,7 +284,10 @@ function codeInjection({ repo, all, tainted }) {
       if (call && call.args[0] && literalValue(call.args[0].text) === null) c.add(f, m.index, `node:vm runs ${label(call.args[0].text)} (vm is not a security sandbox)`);
     }
     for (const m of text.matchAll(/\bset(?:Timeout|Interval)\s*\(\s*(['"`]|[A-Za-z_$][\w$]*\s*\+)/g)) c.add(f, m.index, 'setTimeout/setInterval with a string argument is eval');
-    for (const m of text.matchAll(/\b(?:require|import)\s*\(\s*(?:req|request|params|body|query)\b/g)) c.add(f, m.index, 'module loaded from request data');
+    for (const m of text.matchAll(/\b(?:require|import)\s*\(\s*([^()'"`]+?)\s*\)/g)) {
+      // require(req.query.x) / import(body.plugin): a bare `request` variable in a bundler is a module specifier
+      if (/^(?:req|request|ctx\.request)\.(?:query|params|body)\b|^(?:params|body|query)\.\w/.test(m[1]) || (names.size && isTainted(m[1], names))) c.add(f, m.index, 'module loaded from request data');
+    }
     for (const m of text.matchAll(/require\(\s*['"]vm2['"]\s*\)|from\s+['"]vm2['"]/g)) c.add(f, m.index, 'vm2 is deprecated and has known sandbox escapes');
   }
   return result('APP-09', c.hits, 'No eval, new Function, vm.run* or string timers on non-literal input found.');
@@ -304,7 +351,8 @@ function openRedirect({ repo, server, all, tainted }) {
   for (const f of all.filter((x) => x.kind === 'code' && repo.side(x) === 'client')) {
     const text = repo.code(f) || '';
     const names = taintedNames(text, CLIENT_SOURCE_RE);
-    for (const m of text.matchAll(/\b(?:window\.)?location(?:\.href)?\s*=\s*([^;\n]+)|\blocation\.(?:assign|replace)\(\s*([^)]+)\)/g)) {
+    // assignments only: not comparisons, arrow params, JSX props (location={…}) or declarations
+    for (const m of text.matchAll(/(?<![\w.$]|(?:const|let|var)\s+)(?:window\.|document\.)?location(?:\.href)?\s*=(?![=>{])\s*([^;\n]+)|\blocation\.(?:assign|replace)\(\s*([^)]+)\)/g)) {
       const target = (m[1] || m[2] || '').trim();
       if (!target || literalValue(target) !== null || /^['"`]\//.test(target)) continue;
       if (!isTainted(target, names, CLIENT_SOURCE_RE) || REDIRECT_GUARD_RE.test(near(text, m.index))) continue;

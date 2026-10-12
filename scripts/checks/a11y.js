@@ -47,17 +47,45 @@ function inner(text, end, name) {
   return close === -1 ? '' : text.slice(end, close);
 }
 
+/** The {…} expression of a JSX attribute (onClick={…}), or ''. */
+function attrExpr(tag, name) {
+  const m = new RegExp(`\\b${name}\\s*=\\s*\\{`).exec(tag);
+  if (!m) return '';
+  let depth = 0;
+  for (let i = m.index + m[0].length - 1; i < tag.length; i++) {
+    if (tag[i] === '{') depth++;
+    else if (tag[i] === '}' && --depth === 0) return tag.slice(m.index + m[0].length, i);
+  }
+  return '';
+}
+
+/** onClick={(e) => e.stopPropagation()}: a wrapper that stops bubbling, not a control. */
+function onlyStopsEvents(tag) {
+  const expr = attrExpr(tag, 'onClick');
+  if (!/\b(?:stopPropagation|preventDefault)\s*\(/.test(expr)) return false;
+  return [...expr.matchAll(/([\w$.]+)\s*\(/g)].every((m) => /(?:^|\.)(?:stopPropagation|preventDefault)$/.test(m[1]));
+}
+
 const has = (tag, re) => re.test(tag);
+const PER_FILE = 5;
 const ARIA_NAME_RE = /\baria-label(?:ledby)?\s*=|\btitle\s*=|\{\s*\.\.\./;
 
 function smokeTest(repo) {
-  const files = repo.files.filter((f) => !f.build && UI_FILE_RE.test(f.name) && !repo.isTest(f) && !/(?:^|\/)(?:emails?|mail)\//.test(f.rel));
+  const component = (f) => /\.(?:jsx|tsx|vue|svelte|astro)$/.test(f.name);
+  const framework = repo.files.some((f) => !f.build && component(f));
+  // Vendored or generated HTML (public/pdfjs/viewer.html, coverage and docs output) is not the app's UI.
+  const vendored = (f) => /\.html?$/.test(f.name) && (/(?:^|\/)(?:coverage|docs?|storybook-static|playwright-report|test-results|_site|site)\//.test(f.rel) || (framework && /(?:^|\/)(?:public|static)\/[^/]+\//.test(f.rel)) || /(?:^|\/)(?:vendor|third[_-]?party|lib\/vendor)\//.test(f.rel));
+  const files = repo.files.filter((f) => !f.build && UI_FILE_RE.test(f.name) && !repo.isTest(f) && !/(?:^|\/)(?:emails?|mail)\//.test(f.rel) && !vendored(f));
   if (!files.length) return na('LEGAL-02', 'no UI files (JSX/TSX/Vue/Svelte/HTML templates) found');
   const counts = { ariaLabel: 0, role: 0, aria: 0, h1: 0, img: 0, imgNoAlt: 0, button: 0, buttonNoName: 0, link: 0, linkNoName: 0, clickable: 0, inputs: 0, inputNoLabel: 0 };
   const issues = [];
+  const perFile = new Map();
   const add = (f, index, note) => {
     const line = repo.lineOf(f, index);
-    if (!repo.suppressed(f, line)) issues.push(ev(f.rel, line, note, repo.snippet(f, line)));
+    if (repo.suppressed(f, line)) return;
+    const n = (perFile.get(f.rel) || 0) + 1;
+    perFile.set(f.rel, n);
+    if (n <= PER_FILE) issues.push(ev(f.rel, line, note, repo.snippet(f, line)));
   };
   let pages = 0;
   for (const f of files) {
@@ -91,7 +119,7 @@ function smokeTest(repo) {
       }
     }
     for (const t of tags(text, 'div|span|li|p|section|article|td|tr|i|svg|img')) {
-      if (!/\b(?:onClick|@click|on:click|v-on:click|\(click\))\s*=/.test(t.tag)) continue;
+      if (!/\b(?:onClick|@click|on:click|v-on:click|\(click\))\s*=/.test(t.tag) || onlyStopsEvents(t.tag)) continue;
       counts.clickable++;
       const role = /\brole\s*=/.test(t.tag);
       const focusable = /\btab[iI]ndex\s*=/.test(t.tag);
@@ -118,6 +146,7 @@ function smokeTest(repo) {
     for (const m of text.matchAll(/user-scalable\s*=\s*(?:no|0)|maximum-scale\s*=\s*1(?:\.0)?(?![\d.])/gi)) add(f, m.index, 'the viewport disables zoom (WCAG 1.4.4)');
     for (const m of text.matchAll(/\btab[iI]ndex\s*=\s*(?:["']|\{\s*)([1-9]\d*)/g)) add(f, m.index, `positive tabIndex (${m[1]}) breaks the natural focus order`);
   }
+  for (const [rel, n] of perFile) if (n > PER_FILE) issues.push(ev(rel, null, `${n - PER_FILE} more issue(s) in this file, not listed`));
   const interactive = counts.button + counts.link + counts.inputs + counts.clickable;
   const summary = `Counts across ${files.length} UI file(s): ${counts.ariaLabel} aria-label/labelledby, ${counts.role} role=, ${counts.aria} aria-* total, ${counts.h1} <h1>, ${counts.img} <img> (${counts.imgNoAlt} without alt), ${counts.button} buttons (${counts.buttonNoName} unnamed), ${counts.link} links (${counts.linkNoName} unnamed), ${counts.inputs} form fields (${counts.inputNoLabel} unlabeled), ${counts.clickable} clickable non-buttons.`;
   const extra = [];

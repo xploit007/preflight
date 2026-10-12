@@ -66,6 +66,10 @@ function csrf({ repo, routes, server }) {
   return warn('APP-04', [...sessions, ...writes.slice(0, 8).map((r) => ev(r.file.rel, r.line, `${r.method} ${r.path} changes state with no CSRF token, Origin check or SameSite cookie`))]);
 }
 
+// formData.get('file' | 'upload' | 'avatarFile' …), but not 'profile'. Fields like 'image' or
+// 'avatar' are often URL strings, so those only count with instanceof File / arrayBuffer().
+const FILE_FIELD_RE = /\.get(?:All)?\(\s*['"`](?:\w*(?:File|Upload|Attachment)s?|\w*[_-](?:file|upload|attachment)s?|files?|uploads?|attachments?)['"`]\s*\)/;
+
 // ── APP-07 ─────────────────────────────────────────────────────────────────
 
 function uploads({ repo, server }) {
@@ -92,7 +96,7 @@ function uploads({ repo, server }) {
       found = true;
       if (!/\blimits\b/.test(m[1] || '')) c.add(f, m.index, 'express-fileupload without limits');
     }
-    if (/\.formData\(\)/.test(text) && /\.get\(\s*['"`]\w*file\w*['"`]\s*\)|instanceof\s+File|\.arrayBuffer\(\)/.test(text)) {
+    if (/\.formData\(\)/.test(text) && (FILE_FIELD_RE.test(text) || /instanceof\s+File\b|\.arrayBuffer\(\)/.test(text))) {
       found = true;
       const sizeCheck = /\.size\s*[<>]=?|maxSize|MAX_(?:FILE|UPLOAD)_SIZE|\bsize\s*>/.test(text);
       const typeCheck = /\.type\s*(?:===|!==|\.startsWith|\.includes)|ALLOWED_(?:TYPES|MIME)|allowedTypes|mimetype|file-type/.test(text);
@@ -189,6 +193,10 @@ function debugTools({ repo, routes, server }) {
   return pass('APP-16', ['No debuggers, dev servers, GraphQL playgrounds, unguarded API docs or debug routes found in production paths.']);
 }
 
+const DEV_GUARD_RE = /NODE_ENV|\benv\s*[!=]==?\s*['"`](?:development|dev|production|prod)['"`]|\bis(?:Dev|Development|Prod|Production|Debug)\b|\bdev(?:Mode)?\s*(?:&&|\?)|import\.meta\.env\.(?:DEV|PROD)|\bdebug\s*(?:&&|\?)/;
+const LOG_CALL_RE = /\b(?:console|logger|log|winston|pino|bunyan|Sentry|captureException|reportError|this\.logger)\b[\w.]*\s*\(/;
+const RESPONSE_CTX_RE = /\b(?:res|reply|ctx|response)\b[\w.]*\.(?:json|send|status|body)\b|\bNextResponse\.|\bnew\s+Response\(|\bResponse\.json\(|\bctx\.body\s*=|\.json\(|\breturn\s+(?:json|error)\(/;
+
 // ── APP-17 ─────────────────────────────────────────────────────────────────
 
 function verboseErrors({ repo, server }) {
@@ -202,12 +210,22 @@ function verboseErrors({ repo, server }) {
       lines.add(line);
       c.add(f, index, note);
     };
+    const devOnly = (index, extra = '') => DEV_GUARD_RE.test(`${text.slice(Math.max(0, index - 250), index)}${extra}`);
     for (const m of text.matchAll(/\b(?:res|reply|ctx)\b[^;\n]{0,40}?\.(?:json|send)\(([^;\n]*)\)/g)) {
-      if (/\b(?:err|error|e|ex|exception)\.stack\b/.test(m[1])) once(m.index, 'the error stack trace is sent to the client');
+      if (/\b(?:err|error|e|ex|exception)\.stack\b/.test(m[1])) {
+        if (!devOnly(m.index, m[1])) once(m.index, 'the error stack trace is sent to the client');
+      }
       else if (/^\s*(?:err|error|e|ex)\s*$/.test(m[1])) once(m.index, 'the raw error object is sent to the client');
     }
     for (const m of text.matchAll(/\b(?:NextResponse|Response)\.json\(\s*(?:err|error|e)\s*[,)]/g)) once(m.index, 'the raw error object is returned to the client');
-    for (const m of text.matchAll(/\bstack\s*:\s*(?:err|error|e)\.stack\b/g)) once(m.index, 'the error stack trace is included in a response');
+    for (const m of text.matchAll(/\bstack\s*:\s*(?:err|error|e)\.stack\b/g)) {
+      // only response bodies: logger.error({ stack }) is fine, and so is a development-only branch
+      const lineStart = text.lastIndexOf('\n', m.index) + 1;
+      const before = text.slice(Math.max(0, m.index - 300), m.index);
+      if (LOG_CALL_RE.test(text.slice(lineStart, m.index)) || LOG_CALL_RE.test(before.slice(before.lastIndexOf(';') + 1))) continue;
+      if (!RESPONSE_CTX_RE.test(text.slice(Math.max(0, m.index - 300), m.index + 300)) || devOnly(m.index, text.slice(m.index, m.index + 80))) continue;
+      once(m.index, 'the error stack trace is included in a response');
+    }
   }
   // Self-hosted Express without NODE_ENV=production prints stack traces in its default error page.
   if (repo.hasDep('express')) {
@@ -244,7 +262,10 @@ function logs({ repo, server }) {
     for (const m of text.matchAll(/\bexpress\.static\(\s*['"`][^'"`]*\blogs?\b[^'"`]*['"`]|\bserveIndex\(/g)) c.add(f, m.index, 'a logs folder (or directory listing) is served over HTTP');
     const sensitiveFile = /(?:auth|login|session|pay|checkout|stripe|billing|webhook|password|token)/i.test(f.rel);
     for (const m of text.matchAll(/\b(?:console\.(?:log|info|debug|warn|error)|logger\.(?:info|debug|log|warn|error)|log\.(?:info|debug))\(([^;\n]*)\)/g)) {
-      const args = m[1].replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '""');
+      // presence checks (!!token, Boolean(key), secret.length, key ? '…' : '…') don't log the value
+      const args = m[1]
+        .replace(/(['"`])(?:\\.|(?!\1)[^\\])*\1/g, '""')
+        .replace(/!!\s*[\w$.?]+|\bBoolean\(\s*[\w$.?]+\s*\)|\btypeof\s+[\w$.?]+|[\w$.]+\??\.length\b|[\w$.?]+\s*\?\s*""\s*:\s*""|[\w$.?]+\s*[!=]==?\s*(?:undefined|null)/g, '');
       if (/\b(?:password|passwd|secret|apiKey|api_key|authorization|accessToken|refreshToken|cardNumber|card_number|cvv|ssn)\b/.test(args)) c.add(f, m.index, 'a password/token/secret value is written to the logs');
       else if (sensitiveFile && /\breq\.(?:body|headers)\b/.test(args)) c.add(f, m.index, 'the whole request body/headers is logged in auth/payment code');
     }

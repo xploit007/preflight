@@ -23,12 +23,13 @@ const { SEVERITIES, STATUSES, result } = require('./lib/result');
 const { loadRepo } = require('./lib/repo');
 const { render, useColor } = require('./lib/format');
 
-// Network/subprocess-bound groups first, so their I/O overlaps with the CPU-bound ones.
+// secrets runs first: it records every secret it finds so later groups' snippets mask them.
+// Network/subprocess-bound groups come next, so their I/O overlaps with the CPU-bound ones.
 const GROUPS = [
+  require('./checks/secrets'),
   require('./checks/deps'),
   require('./checks/headers'),
   require('./checks/supabase'),
-  require('./checks/secrets'),
   require('./checks/env'),
   require('./checks/data'),
   require('./checks/auth'),
@@ -246,11 +247,17 @@ async function scan(opts) {
 
   const byId = new Map();
   const timings = {};
+  // Groups run concurrently: syncMs is the CPU time a group spent before its first await
+  // (most of the work), doneAtMs is when it finished, counted from the start of the scan.
   await Promise.all(
     groups.map(async (g) => {
       const t0 = Date.now();
+      const timing = { syncMs: 0, doneAtMs: 0 };
+      timings[g.name] = timing;
       try {
-        const out = await g.run(target, opts);
+        const pending = g.run(target, opts);
+        timing.syncMs = Date.now() - t0;
+        const out = await pending;
         for (const r of out) {
           checkShape(r);
           if (!byId.has(r.id)) byId.set(r.id, r);
@@ -262,7 +269,8 @@ async function scan(opts) {
           }
         }
       }
-      timings[g.name] = Date.now() - t0;
+      if (!timing.syncMs) timing.syncMs = Date.now() - t0;
+      timing.doneAtMs = Date.now() - started;
     }),
   );
 

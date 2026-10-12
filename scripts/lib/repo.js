@@ -9,8 +9,8 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { lineStarts, lineAt, ignoreMatcher, clip, blankComments } = require('./util');
-const { redact } = require('./patterns');
+const { lineStarts, lineAt, ignoreMatcher, clip, blankComments, entropy, escapeRegExp } = require('./util');
+const { redact, mask } = require('./patterns');
 
 // Directories that never hold the app's own code: dependencies, VCS, caches, virtualenvs.
 const SKIP_DIRS = new Set([
@@ -50,7 +50,7 @@ const CLIENT_DIR_RE = /(?:^|\/)(?:components|hooks|contexts?|views|screens|ui|wi
 const SERVER_IMPORT_RE = /(?:require\(\s*|\bfrom\s+|\bimport\s+)['"](?:node:)?(?:fs|fs\/promises|child_process|os|net|http|https|express|fastify|koa|hono|@hono\/node-server|pg|mysql2?|mongoose|mongodb|sequelize|knex|@prisma\/client|drizzle-orm\/[\w-]+|redis|ioredis|stripe|twilio|nodemailer|@sendgrid\/mail|jsonwebtoken|bcrypt|bcryptjs|argon2|firebase-admin|firebase-admin\/[\w-]+|@supabase\/ssr|next\/server|next\/headers|server-only|@vercel\/functions|@netlify\/functions|multer|@aws-sdk\/[\w-]+)['"]|\bDeno\.(?:serve|env)\b|\bexports\.handler\s*=|\bexport\s+(?:const|async\s+function|function)\s+handler\b/;
 // Strong signs of code that runs in the browser.
 const CLIENT_SIGNAL_RE = /\b(?:window|document|localStorage|sessionStorage|navigator)\.|\buse(?:State|Effect|LayoutEffect|Ref|Reducer|Context|Navigate|Router|SearchParams|Query|Mutation)\s*\(|import\.meta\.env\.VITE_|\bonClick\s*=|\bfrom\s+['"](?:react-dom(?:\/client)?|react-router(?:-dom)?|@stripe\/stripe-js|@stripe\/react-stripe-js)['"]/;
-const TEST_PATH_RE = /(?:^|\/)(?:__tests__|__mocks__|tests?|spec|specs|e2e|cypress|playwright|fixtures?|mocks?|stories|\.storybook)\/|\.(?:test|spec|stories|e2e)\.[cm]?[jt]sx?$|(?:^|\/)test_[^/]*\.py$|_test\.(?:py|go)$/;
+const TEST_PATH_RE = /(?:^|\/)(?:__tests__|__mocks__|tests?|testing|spec|specs|e2e|cypress|playwright|fixtures?|mocks?|stories|\.storybook)\/|\.(?:test|spec|stories|e2e|e2e-spec|int-spec|integration|integration-spec|cy)\.[cm]?[jt]sx?$|(?:^|\/)test_[^/]*\.py$|_test\.(?:py|go)$/;
 // Tooling that runs on a developer machine or in CI, not in the deployed app.
 const TOOLING_PATH_RE = /(?:^|\/)(?:scripts|tools|bin|\.github|\.husky|config|migrations|seed|seeds|remix\.init|management\/commands|cli)\/|(?:^|\/)(?:cli|manage)\.(?:py|[cm]?[jt]s)$|(?:^|\/)[\w.-]+\.config\.[cm]?[jt]s$|(?:^|\/)(?:gulpfile|gruntfile|webpack|rollup|vite|next|nuxt|svelte|astro|tailwind|postcss|babel|jest|vitest|playwright|eslint|prettier)\.[\w.]*$/i;
 
@@ -87,6 +87,12 @@ function createRepo(root, opts) {
     git: g,
     get(rel) {
       return byRel.get(rel) || null;
+    },
+    /** Excluded by .preflightignore (checked for the path and each parent folder, like the walk). */
+    userIgnored(rel) {
+      const parts = String(rel).split('/');
+      for (let i = 1; i <= parts.length; i++) if (isIgnoredByUser(parts.slice(0, i).join('/'))) return true;
+      return false;
     },
     read(f) {
       if (typeof f === 'string') f = byRel.get(f);
@@ -128,9 +134,22 @@ function createRepo(root, opts) {
       const e = line < starts.length ? starts[line] - 1 : text.length;
       return text.slice(s, e);
     },
+    /**
+     * Every secret value any check has detected; snippets mask these wherever they appear as a
+     * whole token. Plain words ('prisma', 'postgres') are skipped: masking them everywhere
+     * would garble unrelated evidence, and the pattern-based redaction still covers them.
+     */
+    secrets: new Map(),
+    noteSecret(value) {
+      if (typeof value !== 'string' || value.length < 8 || repo.secrets.has(value)) return;
+      if (/^[A-Za-z]+(?:[_ -][A-Za-z]+)*$/.test(value) && !(value.length >= 20 && entropy(value) >= 3.5)) return;
+      repo.secrets.set(value, new RegExp(`(?<![A-Za-z0-9])${escapeRegExp(value)}(?![A-Za-z0-9])`, 'g'));
+    },
     /** Redacted, clipped source line for evidence (only a bounded window is redacted, so huge minified lines stay fast). */
     snippet(f, line, max = 120) {
-      return clip(redact(repo.lineText(f, line).slice(0, 1000)), max);
+      let text = repo.lineText(f, line).slice(0, 1000);
+      for (const [v, re] of repo.secrets) if (text.includes(v)) text = text.replace(re, mask(v));
+      return clip(redact(text), max);
     },
     /** Minified/bundled-looking file: *.min.* or long average line length. Heuristics skip these. */
     isMinified(f) {

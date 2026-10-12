@@ -17,7 +17,43 @@ const IDS = ['DATA-03', 'DATA-04', 'DATA-05', 'DATA-06', 'DATA-07'];
 const IDENT = '(?:"?[A-Za-z_][\\w$]*"?\\.)?"?[A-Za-z_][\\w$]*"?';
 const POLICY_RE = new RegExp(`\\bcreate\\s+policy\\s+(?:"[^"]*"|[\\w$]+)\\s+on\\s+(${IDENT})([\\s\\S]*?);`, 'gi');
 const VIEW_RE = new RegExp(`\\bcreate\\s+(?:or\\s+replace\\s+)?view\\s+(${IDENT})([\\s\\S]*?)\\bas\\b`, 'gi');
-const SECURITY_DEFINER_FN_RE = /\bcreate\s+(?:or\s+replace\s+)?function\s+(?:public\.)?"?(\w+)"?[\s\S]{0,2000}?\bsecurity\s+definer\b/gi;
+const CREATE_FN_RE = /\bcreate\s+(?:or\s+replace\s+)?function\s+(?:"?\w+"?\.)?"?(\w+)"?/gi;
+
+/**
+ * Whole CREATE FUNCTION statements: header, body (dollar-quoted or single-quoted) and the
+ * trailing options, up to the terminating semicolon. `options` excludes the body, so a
+ * SECURITY DEFINER written inside a function's code doesn't count.
+ */
+function sqlFunctions(sql) {
+  const out = [];
+  for (const m of sql.matchAll(CREATE_FN_RE)) {
+    let i = m.index + m[0].length;
+    let options = '';
+    let end = sql.length;
+    for (let guard = 0; i < sql.length && guard < 200000; guard++) {
+      const rest = sql.slice(i);
+      const next = rest.search(/\$[A-Za-z_]*\$|'|;/);
+      if (next === -1) break;
+      options += rest.slice(0, next);
+      const at = i + next;
+      if (sql[at] === ';') {
+        end = at + 1;
+        break;
+      }
+      if (sql[at] === "'") {
+        let j = at + 1;
+        while (j < sql.length && !(sql[j] === "'" && sql[j + 1] !== "'")) j += sql[j] === "'" ? 2 : 1;
+        i = j + 1;
+      } else {
+        const tag = /^\$[A-Za-z_]*\$/.exec(sql.slice(at))[0];
+        const close = sql.indexOf(tag, at + tag.length);
+        i = close === -1 ? sql.length : close + tag.length;
+      }
+    }
+    out.push({ name: m[1], index: m.index, options, text: sql.slice(m.index, end) });
+  }
+  return out;
+}
 const CREATE_TABLE_BODY_RE = new RegExp(`\\bcreate\\s+(?:unlogged\\s+)?table\\s+(?:if\\s+not\\s+exists\\s+)?(${IDENT})\\s*\\(`, 'gi');
 
 const CARD_COLUMN_RE = /^(?:card_?number|cc_?number|credit_?card(?:_?number)?|cardnum|card_?no|pan|cvv2?|cvc2?|card_?cvc|card_?cvv|card_?security_?code|security_?code)$/;
@@ -97,6 +133,7 @@ function openRules(repo) {
     if (!repo.suppressed(f, line)) list.push(ev(f.rel, line, note, repo.snippet(f, line)));
   };
   let checkedSomething = false;
+  const supabase = usesSupabase(repo);
   for (const f of repo.files) {
     if (f.build) continue;
     const text = repo.code(f);
@@ -128,11 +165,17 @@ function openRules(repo) {
         if ((usingTrue || checkTrue) && cmd !== 'select') add(bad, f, m.index, `policy on ${table} lets ${roles === 'public' ? 'anyone' : roles} ${cmd === 'all' ? 'read and write' : cmd} with an always-true condition`);
         else if (usingTrue && cmd === 'select') add(soft, f, m.index, `policy on ${table} makes every row readable by ${roles === 'public' ? 'anyone, including anonymous users' : roles}`);
       }
-      for (const m of clean.matchAll(VIEW_RE)) {
-        const name = m[1].replace(/"/g, '');
-        if (/^(?:public\.)?\w+$/.test(name) && !/security_invoker/i.test(m[2])) add(soft, f, m.index, `view ${name} runs with its owner's privileges and bypasses RLS (add "with (security_invoker = true)")`);
+      // Owner-privileged views and definer functions only bypass anything where the API exposes
+      // the schema under RLS (Supabase/PostgREST); in a plain Postgres app they are normal.
+      if (supabase) {
+        for (const m of clean.matchAll(VIEW_RE)) {
+          const name = m[1].replace(/"/g, '');
+          if (/^(?:public\.)?\w+$/.test(name) && !/security_invoker/i.test(m[2])) add(soft, f, m.index, `view ${name} runs with its owner's privileges and bypasses RLS (add "with (security_invoker = true)")`);
+        }
+        for (const fn of sqlFunctions(clean)) {
+          if (/\bsecurity\s+definer\b/i.test(fn.options) && !/\bset\s+search_path\b/i.test(fn.text)) add(soft, f, fn.index, `security definer function ${fn.name} has no fixed search_path`);
+        }
       }
-      for (const m of clean.matchAll(SECURITY_DEFINER_FN_RE)) if (!/set\s+search_path/i.test(m[0])) add(soft, f, m.index, `security definer function ${m[1]} has no fixed search_path`);
       for (const m of clean.matchAll(/insert\s+into\s+storage\.buckets\s*\(([^)]*)\)\s*values\s*\(([^)]*)\)/gi)) {
         const colsList = m[1].split(',').map((s) => s.trim().replace(/"/g, ''));
         const vals = m[2].split(',').map((s) => s.trim());
@@ -146,7 +189,9 @@ function openRules(repo) {
     }
     if (f.kind === 'config' && /^docker-compose|compose\.ya?ml$/.test(f.name)) {
       checkedSomething = true;
-      for (const m of text.matchAll(/POSTGRES_HOST_AUTH_METHOD\s*[:=]\s*["']?trust/g)) add(bad, f, m.index, 'Postgres accepts connections without a password (trust auth)');
+      // trust auth is an open database once the port is reachable: fail when Postgres is published on all interfaces
+      const pgPublished = /^\s*-\s*["']?(?:0\.0\.0\.0:)?\d+:5432\b/m.test(text);
+      for (const m of text.matchAll(/POSTGRES_HOST_AUTH_METHOD\s*[:=]\s*["']?trust/g)) add(pgPublished ? bad : soft, f, m.index, `Postgres accepts connections without a password (trust auth)${pgPublished ? ', and its port is published on all interfaces' : ''}`);
       for (const m of text.matchAll(/xpack\.security\.enabled\s*[:=]\s*["']?false/g)) add(soft, f, m.index, 'Elasticsearch security is disabled');
       for (const m of text.matchAll(/^\s*-\s*["']?(?:0\.0\.0\.0:)?(5432|3306|27017|6379|9200|5672|1433):\d+["']?\s*$/gm)) add(soft, f, m.index, `database port ${m[1]} is published on all interfaces; on a server this is reachable from the internet`);
     }
@@ -306,4 +351,4 @@ function backups(repo) {
   return manual('DATA-07', evidence);
 }
 
-module.exports = { name: 'data', ids: IDS, run, collectColumns };
+module.exports = { name: 'data', ids: IDS, run, collectColumns, sqlFunctions };

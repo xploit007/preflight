@@ -7,9 +7,10 @@
  */
 
 const { loadRepo } = require('../lib/repo');
-const { getRoutes, routeBody } = require('../lib/routes');
+const { getRoutes, routeBody, segments } = require('../lib/routes');
+const { AUTH_RE } = require('../lib/primitives');
 const { taintedNames, isTainted } = require('../lib/taint');
-const { pass, fail, manual, na, ev } = require('../lib/result');
+const { pass, fail, warn, manual, na, ev } = require('../lib/result');
 const { splitArgs, objectAt } = require('../lib/util');
 
 const IDS = ['LEGAL-01', 'LEGAL-03', 'APP-12'];
@@ -28,7 +29,7 @@ const SMS_PROVIDERS = [
 ];
 const CONSENT_RE = /\b(?:sms_?consent|smsConsent|consent(?:ed)?_?at|consentedAt|opt_?in|optIn|opted_?in|optedIn|tcpa|marketing_?consent|sms_?opt)\b/i;
 const OPTOUT_RE = /['"`](?:STOP|UNSUBSCRIBE|STOPALL|CANCEL|QUIT)['"`]|\bopt_?out\b|\boptOut\b|\bopted_?out\b|\bunsubscribed\b/i;
-const VERIFY_RE = /constructEvent(?:Async)?\s*\(|\bwebhooks\.(?:constructEvent|verify|unwrap|verifySignature)\s*\(|validateRequest(?:WithBody)?\s*\(|\btwilio\.webhook\s*\(|\bnew\s+Webhook\s*\(|\bwh\.verify\s*\(|verifyWebhook\s*\(|verifySignature\s*\(|validateSignature\s*\(|isValidSignature|checkSignature|verify_signature|timingSafeEqual\s*\(|crypto\.subtle\.verify\s*\(|paddle\.webhooks\.unmarshal|validateWebhookSignature|shopify\.webhooks\.validate|@octokit\/webhooks|verifyAndReceive|standardwebhooks|from\s+['"]svix['"]|require\(\s*['"]svix['"]\s*\)/;
+const VERIFY_RE = /construct\w*Event(?:Async)?\s*\(|\bwebhooks\.(?:constructEvent|verify|unwrap|verifySignature)\s*\(|validateRequest(?:WithBody)?\s*\(|\btwilio\.webhook\s*\(|\bnew\s+Webhook\s*\(|\bwh\.verify\s*\(|verifyWebhook\s*\(|verifySignature\s*\(|validateSignature\s*\(|isValidSignature|checkSignature|verify_signature|timingSafeEqual\s*\(|crypto\.subtle\.verify\s*\(|paddle\.webhooks\.unmarshal|validateWebhookSignature|shopify\.webhooks\.validate|@octokit\/webhooks|verifyAndReceive|standardwebhooks|from\s+['"]svix['"]|require\(\s*['"]svix['"]\s*\)/;
 
 async function run(root, opts = {}) {
   const repo = loadRepo(root, opts);
@@ -142,11 +143,37 @@ function payments(repo, code) {
 
 // ── APP-12 ─────────────────────────────────────────────────────────────────
 
+// An HMAC computed and compared by hand, or a secret request header compared with a stored secret.
+const SIG_COMPARE_RE = /[!=]==?\s*[\w.[\]('"-]*(?:sig|hmac|signed|digest)|(?:sig|hmac|signed|digest)[\w-]*['"\])]*\s*[!=]==?/i;
+const HEADER_SECRET_RE = /headers[\s\S]{0,300}?\b\w*(?:secret|token)\w*\s*[!=]==?\s*(?:process\.env\.)?\w*(?:secret|token)\w*/i;
+const manualVerify = (t) => (/createHmac\s*\(|crypto\.subtle\.(?:sign|importKey)\s*\(/.test(t) && SIG_COMPARE_RE.test(t)) || HEADER_SECRET_RE.test(t);
+// Reads the request body itself…
+const READS_BODY_RE = /\b(?:req|request|event|ctx|c)\b[\w.]*\.(?:body|json\(|text\(|arrayBuffer\(|formData\(|rawBody|on\(\s*['"]data)|\b(?:buffer|getRawBody|rawBody|readBody|text|json)\(\s*(?:req|request|event)\b/;
+// …or hands the request object to another function.
+const FORWARDS_REQ_RE = /\b([A-Za-z_$][\w$.]*)\s*\([^()]*\b(?:req|request)\b\s*[,)]/g;
+const NOT_FORWARDING_RE = /^(?:NextResponse|Response|res|reply|console|log|logger)\b|\.(?:json|send|status|end|redirect|get|headers)$|^(?:function|handler|postHandler|defaultResponder\w*|withMiddleware|wrap\w*)$/;
+
+/** First function the request object is passed to (not the handler's own definition), or null. */
+function forwardTarget(text) {
+  for (const m of text.matchAll(FORWARDS_REQ_RE)) {
+    if (NOT_FORWARDING_RE.test(m[1])) continue;
+    const close = text.indexOf(')', m.index + m[0].length - 1);
+    if (/^\s*(?::[^={;]{0,200})?(?:\{|=>)/.test(text.slice(close + 1, close + 210))) continue; // webhook(req, res) { … }: a definition
+    return m[1];
+  }
+  return null;
+}
+
 function webhooks(repo) {
   const { routes } = getRoutes(repo);
   const candidates = new Map();
   for (const r of routes) {
-    if (/webhook/i.test(r.path) || /webhook/i.test(r.file.rel) || (r.handler && /webhook/i.test(r.handler.file.rel))) candidates.set(`${r.file.rel}:${r.line}`, r);
+    if (!['POST', 'PUT', 'ANY', 'ALL'].includes(r.method)) continue; // providers POST events; GET /webhooks lists them
+    if (r.framework === 'server-action' || /(?:^|\/)trpc(?:\/|$)/.test(r.path)) continue; // providers can't call server actions or tRPC
+    if (!(/webhook/i.test(r.path) || /webhook/i.test(r.file.rel) || (r.handler && /webhook/i.test(r.handler.file.rel)))) continue;
+    // A signed-in user's endpoint (creating webhook subscriptions, admin tools) is not a receiver.
+    if ((AUTH_RE.test(`${r.mountMiddleware || ''}\n${routeBody(r)}`) && !VERIFY_RE.test(routeBody(r))) || /@UseGuards/.test(r.mountMiddleware || '')) continue;
+    candidates.set(`${r.file.rel}:${r.line}`, r);
   }
   if (!candidates.size) {
     const files = repo.sources({ kinds: ['code'], tests: false }).filter((f) => repo.side(f) !== 'client' && /webhook/i.test(f.rel) && !repo.isTooling(f));
@@ -155,16 +182,29 @@ function webhooks(repo) {
     return bad.length ? fail('APP-12', bad) : pass('APP-12', files.map((f) => ev(f.rel, null, 'webhook signature verified')));
   }
   const bad = [];
+  const soft = [];
   const ok = [];
   for (const r of candidates.values()) {
-    const texts = [routeBody(r), repo.code(r.file) || ''];
+    const body = routeBody(r);
+    const texts = [body, repo.code(r.file) || ''];
     if (r.handler) texts.push(repo.code(r.handler.file) || '');
-    const verified = texts.some((t) => VERIFY_RE.test(t)) || VERIFY_RE.test(r.mountMiddleware || '');
+    const verified = texts.some((t) => VERIFY_RE.test(t) || manualVerify(t)) || VERIFY_RE.test(r.mountMiddleware || '');
     const where = r.handler && r.handler.file !== r.file ? ` (handler in ${r.handler.file.rel}:${repo.lineOf(r.handler.file, r.handler.start)})` : '';
-    if (verified) ok.push(ev(r.file.rel, r.line, `${r.method} ${r.path} verifies the signature`));
+    if (verified) {
+      ok.push(ev(r.file.rel, r.line, `${r.method} ${r.path} verifies the signature`));
+      continue;
+    }
+    // Reads the body itself: unverified. Only hands the request on: verification may be in there.
+    // Neither (a stub returning 404/410): receives nothing.
+    const own = segments(r, { helpers: false }).map((x) => x.text).join('\n');
+    const forwardedTo = forwardTarget(own);
+    if (!READS_BODY_RE.test(own) && !forwardedTo) continue;
+    if (!READS_BODY_RE.test(own)) soft.push(ev(r.file.rel, r.line, `${r.method} ${r.path} hands the request to ${forwardedTo}() and no signature check is visible here${where}`, repo.snippet(r.file, r.line)));
     else bad.push(ev(r.file.rel, r.line, `${r.method} ${r.path} accepts webhook events without verifying the provider's signature${where}`, repo.snippet(r.file, r.line)));
   }
-  if (bad.length) return fail('APP-12', [...bad, ...ok]);
+  if (bad.length) return fail('APP-12', [...bad, ...soft, ...ok]);
+  if (!soft.length && !ok.length) return na('APP-12', 'webhook routes found, but none of them read the request (stubs)');
+  if (soft.length) return warn('APP-12', [...soft, ...ok], { question: 'Does the function each webhook hands its request to verify the provider\'s signature (or a shared secret) before acting on the event?' });
   return pass('APP-12', ok);
 }
 
