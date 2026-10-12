@@ -183,6 +183,23 @@ function parseAudit(pm, stdout, lockText) {
   return { vulns };
 }
 
+/**
+ * Package managers that would execute code from the repo itself: yarn delegates to a checked-in
+ * binary via yarn-path / yarnPath, and pnpm loads .pnpmfile.cjs hooks. preflight never runs those.
+ */
+function repoCodeRunner(dir, pm) {
+  const read = (name) => {
+    try {
+      return fs.readFileSync(path.join(dir, name), 'utf8');
+    } catch {
+      return '';
+    }
+  };
+  if (pm === 'yarn' && (/^\s*yarn-path\s/m.test(read('.yarnrc')) || /^\s*yarnPath\s*:/m.test(read('.yarnrc.yml')))) return 'the repo pins its own yarn binary (yarn-path/yarnPath)';
+  if (pm === 'pnpm' && (fs.existsSync(path.join(dir, '.pnpmfile.cjs')) || fs.existsSync(path.join(dir, '.pnpmfile.mjs')))) return 'the repo has a .pnpmfile hook';
+  return null;
+}
+
 async function audit({ repo, pkgs, opts }) {
   if (!pkgs.length) return na('DEP-01', 'no package.json with dependencies');
   const roots = new Map();
@@ -198,6 +215,11 @@ async function audit({ repo, pkgs, opts }) {
   const errors = [];
   for (const lock of [...roots.values()].slice(0, 3)) {
     const cwd = path.join(repo.root, lock.dir);
+    const unsafe = repoCodeRunner(cwd, lock.pm);
+    if (unsafe) {
+      errors.push(`${lock.f.rel}: ${lock.pm} audit was not run because ${unsafe}, so running it would execute code from the scanned repo. Run the audit yourself if you trust this repo.`);
+      continue;
+    }
     const isBerry = lock.pm === 'yarn' && !/^# yarn lockfile v1/m.test(repo.read(lock.f) || '');
     const cmd = { npm: ['npm', ['audit', '--json']], pnpm: ['pnpm', ['audit', '--json']], yarn: isBerry ? ['yarn', ['npm', 'audit', '--json', '--recursive']] : ['yarn', ['audit', '--json']], bun: ['bun', ['audit', '--json']] }[lock.pm];
     const res = await runCommand(cmd[0], cmd[1], cwd);

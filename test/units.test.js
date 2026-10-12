@@ -191,3 +191,25 @@ test('CLI: --only, --fail-on and usage errors', () => {
   assert.equal(scan(['.', '--supabase-url', 'https://x.supabase.co']).status, 2);
   assert.match(scan(['--help']).stdout, /Usage: node scripts\/scan\.js/);
 });
+
+test('never runs a package manager binary pinned inside the scanned repo', () => {
+  const dir = tempDir({
+    'package.json': JSON.stringify({ name: 'x', dependencies: { express: '^5.0.0' } }),
+    'yarn.lock': '# yarn lockfile v1\n\nexpress@^5.0.0:\n  version "5.1.0"\n',
+    '.yarnrc': 'yarn-path "./.yarn/releases/evil.js"\n',
+    '.yarn/releases/evil.js': "require('fs').writeFileSync(require('path').join(__dirname, 'PWNED'), 'x');\n",
+  });
+  const r = byId(scan([dir, '--json', '--only', 'DEP-01']).json).get('DEP-01');
+  assert.equal(r.status, 'manual');
+  assert.match(r.evidence.join('\n'), /would execute code from the scanned repo/);
+  assert.equal(fs.existsSync(path.join(dir, '.yarn', 'releases', 'PWNED')), false);
+});
+
+test('terminal escape sequences in scanned files never reach the output', () => {
+  const key = SAMPLES['Stripe live secret key'];
+  const dir = tempDir({ 'server.js': `const a = "${key}"; // \u001b[2J\u001b]0;pwned\u0007‮\n` });
+  const res = scan([dir, '--offline', '--only', 'SEC-03']);
+  assert.ok(!/[\u001b\u0007‮]/.test(res.stdout), JSON.stringify(res.stdout.slice(0, 300)));
+  const json = scan([dir, '--json', '--offline', '--only', 'SEC-03']).json;
+  assert.ok(!/[\u001b\u0007‮]/.test(json.results[0].evidence.join('')));
+});

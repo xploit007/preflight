@@ -27,9 +27,15 @@ function lineAt(starts, index) {
   return lo + 1;
 }
 
+/** Remove control characters (incl. ANSI escapes) so scanned content can't drive the terminal. */
+function stripControl(text) {
+  // eslint-disable-next-line no-control-regex
+  return String(text).replace(/\u001b\[[0-9;?]*[ -/]*[@-~]|[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, '');
+}
+
 /** Collapse whitespace and cut to `max` characters. */
 function clip(text, max = 140) {
-  const s = String(text).replace(/\s+/g, ' ').trim();
+  const s = stripControl(text).replace(/\s+/g, ' ').trim();
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
@@ -381,6 +387,7 @@ function ignoreMatcher(lines) {
 }
 
 module.exports = {
+  stripControl,
   lineStarts,
   lineAt,
   clip,

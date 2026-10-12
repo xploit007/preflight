@@ -2125,6 +2125,23 @@ function parseAudit(pm, stdout, lockText) {
   return { vulns };
 }
 
+/**
+ * Package managers that would execute code from the repo itself: yarn delegates to a checked-in
+ * binary via yarn-path / yarnPath, and pnpm loads .pnpmfile.cjs hooks. preflight never runs those.
+ */
+function repoCodeRunner(dir, pm) {
+  const read = (name) => {
+    try {
+      return fs.readFileSync(path.join(dir, name), 'utf8');
+    } catch {
+      return '';
+    }
+  };
+  if (pm === 'yarn' && (/^\s*yarn-path\s/m.test(read('.yarnrc')) || /^\s*yarnPath\s*:/m.test(read('.yarnrc.yml')))) return 'the repo pins its own yarn binary (yarn-path/yarnPath)';
+  if (pm === 'pnpm' && (fs.existsSync(path.join(dir, '.pnpmfile.cjs')) || fs.existsSync(path.join(dir, '.pnpmfile.mjs')))) return 'the repo has a .pnpmfile hook';
+  return null;
+}
+
 async function audit({ repo, pkgs, opts }) {
   if (!pkgs.length) return na('DEP-01', 'no package.json with dependencies');
   const roots = new Map();
@@ -2140,6 +2157,11 @@ async function audit({ repo, pkgs, opts }) {
   const errors = [];
   for (const lock of [...roots.values()].slice(0, 3)) {
     const cwd = path.join(repo.root, lock.dir);
+    const unsafe = repoCodeRunner(cwd, lock.pm);
+    if (unsafe) {
+      errors.push(`${lock.f.rel}: ${lock.pm} audit was not run because ${unsafe}, so running it would execute code from the scanned repo. Run the audit yourself if you trust this repo.`);
+      continue;
+    }
     const isBerry = lock.pm === 'yarn' && !/^# yarn lockfile v1/m.test(repo.read(lock.f) || '');
     const cmd = { npm: ['npm', ['audit', '--json']], pnpm: ['pnpm', ['audit', '--json']], yarn: isBerry ? ['yarn', ['npm', 'audit', '--json', '--recursive']] : ['yarn', ['audit', '--json']], bun: ['bun', ['audit', '--json']] }[lock.pm];
     const res = await runCommand(cmd[0], cmd[1], cwd);
@@ -3523,7 +3545,7 @@ function historyFindings(repo, opts) {
           if (!ENV_FILE_RE.test(base) || /(?:example|sample|template|dist|defaults|schema)/i.test(base)) continue;
           // Only env files that held secret-looking values count (public config like NEXT_PUBLIC_* is fine).
           const sha = header.split(' ')[0];
-          const content = repo.git.run(['show', `${sha}:./${line.trim()}`]) || '';
+          const content = repo.git.run(['cat-file', 'blob', `${sha}:./${line.trim()}`]) || ''; // cat-file never runs textconv/filters
           const secrets = parseEnv(content).filter((e) => secretLabel(e));
           if (secrets.length) envAdds.push({ file: line.trim(), header, count: secrets.length });
         }
@@ -4731,6 +4753,7 @@ module.exports = { GROUPS, CHECKS, getCheck };
 /** Human-readable terminal report. JSON output lives in scan.js. */
 
 const { SEVERITIES } = require('./result');
+const { stripControl } = require('./util');
 
 const STATUS_ORDER = { fail: 0, warn: 1, manual: 2, pass: 3 };
 
@@ -4777,7 +4800,7 @@ function render(report, { verbose = false, color = false } = {}) {
     if (r.status === 'pass' && !verbose) continue;
     out.push(`${label[r.status]}  ${sev(r.severity)}  ${c.bold(pad(r.id, 8))}  ${r.title}`);
     const shown = r.evidence.slice(0, maxEvidence);
-    for (const e of shown) out.push(`            ${c.dim('·')} ${e}`);
+    for (const e of shown) out.push(`            ${c.dim('·')} ${stripControl(e)}`);
     if (r.evidence.length > shown.length) out.push(c.dim(`            · …${r.evidence.length - shown.length} more (--verbose or --json)`));
     if (r.question) out.push(`            ${c.cyan('?')} ${r.question}`);
     if (r.status !== 'pass') out.push(`            ${c.green('→')} ${verbose ? r.fix : firstSentence(r.fix)}`);
@@ -5674,6 +5697,7 @@ module.exports = {
  */
 
 const { getCheck } = require('./catalog');
+const { stripControl } = require('./util');
 
 const SEVERITIES = ['critical', 'high', 'medium', 'low'];
 const STATUSES = ['fail', 'warn', 'manual', 'pass'];
@@ -5683,7 +5707,7 @@ const MAX_EVIDENCE = 25;
 function result(id, status, evidence = [], extra = {}) {
   if (!STATUSES.includes(status)) throw new Error(`Bad status ${status} for ${id}`);
   const meta = getCheck(id);
-  const lines = dedupe(evidence.filter((e) => typeof e === 'string' && e.trim()));
+  const lines = dedupe(evidence.filter((e) => typeof e === 'string' && e.trim()).map((e) => stripControl(e)));
   const capped = lines.length > MAX_EVIDENCE ? [...lines.slice(0, MAX_EVIDENCE - 1), `…and ${lines.length - MAX_EVIDENCE + 1} more`] : lines;
   const r = {
     id,
@@ -6238,9 +6262,15 @@ function lineAt(starts, index) {
   return lo + 1;
 }
 
+/** Remove control characters (incl. ANSI escapes) so scanned content can't drive the terminal. */
+function stripControl(text) {
+  // eslint-disable-next-line no-control-regex
+  return String(text).replace(/\u001b\[[0-9;?]*[ -/]*[@-~]|[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, '');
+}
+
 /** Collapse whitespace and cut to `max` characters. */
 function clip(text, max = 140) {
-  const s = String(text).replace(/\s+/g, ' ').trim();
+  const s = stripControl(text).replace(/\s+/g, ' ').trim();
   return s.length > max ? `${s.slice(0, max - 1)}…` : s;
 }
 
@@ -6592,6 +6622,7 @@ function ignoreMatcher(lines) {
 }
 
 module.exports = {
+  stripControl,
   lineStarts,
   lineAt,
   clip,

@@ -270,7 +270,7 @@ function historyFindings(repo, opts) {
           if (!ENV_FILE_RE.test(base) || /(?:example|sample|template|dist|defaults|schema)/i.test(base)) continue;
           // Only env files that held secret-looking values count (public config like NEXT_PUBLIC_* is fine).
           const sha = header.split(' ')[0];
-          const content = repo.git.run(['show', `${sha}:./${line.trim()}`]) || '';
+          const content = repo.git.run(['cat-file', 'blob', `${sha}:./${line.trim()}`]) || ''; // cat-file never runs textconv/filters
           const secrets = parseEnv(content).filter((e) => secretLabel(e));
           if (secrets.length) envAdds.push({ file: line.trim(), header, count: secrets.length });
         }

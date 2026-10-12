@@ -7,6 +7,7 @@
  */
 
 const { getCheck } = require('./catalog');
+const { stripControl } = require('./util');
 
 const SEVERITIES = ['critical', 'high', 'medium', 'low'];
 const STATUSES = ['fail', 'warn', 'manual', 'pass'];
@@ -16,7 +17,7 @@ const MAX_EVIDENCE = 25;
 function result(id, status, evidence = [], extra = {}) {
   if (!STATUSES.includes(status)) throw new Error(`Bad status ${status} for ${id}`);
   const meta = getCheck(id);
-  const lines = dedupe(evidence.filter((e) => typeof e === 'string' && e.trim()));
+  const lines = dedupe(evidence.filter((e) => typeof e === 'string' && e.trim()).map((e) => stripControl(e)));
   const capped = lines.length > MAX_EVIDENCE ? [...lines.slice(0, MAX_EVIDENCE - 1), `…and ${lines.length - MAX_EVIDENCE + 1} more`] : lines;
   const r = {
     id,

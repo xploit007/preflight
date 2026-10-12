@@ -3,6 +3,7 @@
 /** Human-readable terminal report. JSON output lives in scan.js. */
 
 const { SEVERITIES } = require('./result');
+const { stripControl } = require('./util');
 
 const STATUS_ORDER = { fail: 0, warn: 1, manual: 2, pass: 3 };
 
@@ -49,7 +50,7 @@ function render(report, { verbose = false, color = false } = {}) {
     if (r.status === 'pass' && !verbose) continue;
     out.push(`${label[r.status]}  ${sev(r.severity)}  ${c.bold(pad(r.id, 8))}  ${r.title}`);
     const shown = r.evidence.slice(0, maxEvidence);
-    for (const e of shown) out.push(`            ${c.dim('·')} ${e}`);
+    for (const e of shown) out.push(`            ${c.dim('·')} ${stripControl(e)}`);
     if (r.evidence.length > shown.length) out.push(c.dim(`            · …${r.evidence.length - shown.length} more (--verbose or --json)`));
     if (r.question) out.push(`            ${c.cyan('?')} ${r.question}`);
     if (r.status !== 'pass') out.push(`            ${c.green('→')} ${verbose ? r.fix : firstSentence(r.fix)}`);
