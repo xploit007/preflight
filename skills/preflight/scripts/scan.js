@@ -3999,7 +3999,7 @@ const CHECKS = [
     script: 'secrets.js',
     what: 'Default or easily guessed passwords (admin/admin, postgres/postgres, changeme…) in code, seed data or deployment config.',
     why: 'Bots try default credentials first. A database or admin panel with a default password is effectively open.',
-    detect: 'Script: password comparisons against common defaults in login code (fail), admin seed users with default passwords, and docker-compose/DB env vars set to defaults while the port is published (warn). The agent checks whether each one can reach production.',
+    detect: 'Script: password comparisons against common defaults in login code and admin accounts seeded with default passwords (fail); other default passwords in seed data, docker-compose or DB env vars, noting when the port is published on all interfaces (warn). The agent checks whether each one can reach production.',
     fix: 'Remove hardcoded credential checks entirely. Seed admin users with a random password that is printed once or comes from an env var, and force a reset on first login. Use strong, unique DB passwords for anything reachable from the internet, and bind dev databases to 127.0.0.1 in docker-compose.',
     question: 'Can this default credential reach a production system or a publicly reachable port?',
   },
@@ -4185,7 +4185,7 @@ const CHECKS = [
     script: 'data.js',
     what: 'Rules or policies that grant everyone access: Firestore/Storage `allow read, write: if true`, test-mode date rules, RTDB `".read": true`, Supabase `using (true)` on writes, grants to anon, public buckets.',
     why: 'Open rules are the same as no auth. In 2025 the Tea app leaked about 72,000 images, including 13,000 ID photos, from an unsecured Firebase storage bucket.',
-    detect: 'Script: parses firestore.rules, storage.rules, database.rules.json and SQL policies and grants. Always-true conditions, test-mode expiry rules and write grants to anon fail. `using (true)` SELECT policies, public storage buckets, security-definer views and publicly bound DB ports warn.',
+    detect: 'Script: parses firestore.rules, storage.rules, database.rules.json, SQL policies, docker-compose files and Terraform. Always-true rules, test-mode expiry rules, write policies with `using (true)`, Postgres trust auth and publicly accessible DB instances fail. `using (true)` SELECT policies, public storage buckets, security-definer views and functions, and publicly bound DB ports warn.',
     fix: 'Write rules that check identity and ownership (`allow read, write: if request.auth != null && request.auth.uid == resource.data.userId;`, `using (auth.uid() = user_id)`). Keep buckets private and serve files through signed URLs. Test your rules with the Firebase emulator or Supabase\'s policy tools before launch.',
     question: 'Is this access intentionally public (e.g. published blog posts)? If not, what ownership condition should the rule enforce?',
   },
@@ -4278,7 +4278,7 @@ const CHECKS = [
     script: 'infra.js',
     what: 'Function timeouts, memory, concurrency/instance limits and regions that let one request, or one attacker, burn compute.',
     why: 'You pay for duration × memory × invocations. A 300-second maxDuration on a public LLM route makes every abusive request expensive, and a function far from its database pays for every round trip.',
-    detect: 'Script: reads maxDuration, memory and regions in vercel.json and route files, Netlify functions config, wrangler [limits], serverless timeout/reservedConcurrency, Firebase maxInstances, and Fly/Render scaling. Durations of 300s or more warn, and every detected provider gets a manual checklist.',
+    detect: 'Script: reads maxDuration and regions in vercel.json and route files (`export const maxDuration`), wrangler [limits] cpu_ms, serverless.yml timeouts, Firebase setGlobalOptions/runWith options, and fly.toml auto_stop_machines/min_machines_running. Durations of 300s or more and machines that never stop warn; otherwise the detected provider gets a manual checklist.',
     fix: 'Give each route the lowest maxDuration it needs (10–60s for most APIs) and cap instances and concurrency. Stream or queue long jobs instead of holding functions open, and put function regions next to your database region.',
     question: 'What is the longest a single request can run and bill on each route, and is the function region next to the database?',
   },
@@ -6144,17 +6144,29 @@ function declaredNames(m) {
     .filter((n) => /^[A-Za-z_$][\w$]*$/.test(n));
 }
 
+/** One regex matching any of `names` as a standalone identifier (not a property). */
+const namesRegexCache = new WeakMap();
+function namesRegex(names) {
+  if (!names.size) return null;
+  const cached = namesRegexCache.get(names);
+  if (cached && cached.size === names.size) return cached.re;
+  const re = new RegExp(`(?<![\\w$.])(?:${[...names].map(escapeRegExp).join('|')})\\b`);
+  namesRegexCache.set(names, { re, size: names.size });
+  return re;
+}
+
 /** Identifiers in `text` that hold data from `sourceRe` (default: server request data). */
 function taintedNames(text, sourceRe = SERVER_SOURCE_RE) {
   const names = new Set();
   const assign = /\b(?:const|let|var)\s+(?:([A-Za-z_$][\w$]*)|\{([^}]*)\}|\[([^\]]*)\])\s*=\s*([^;\n]+)/g;
+  const assignments = [...text.matchAll(assign)];
   for (let round = 0; round < 3; round++) {
     let changed = false;
-    for (const m of text.matchAll(assign)) {
+    for (const m of assignments) {
       const rhs = m[4];
       if (NEUTRALIZER_RE.test(rhs)) continue;
-      const tainted = sourceRe.test(rhs) || [...names].some((n) => new RegExp(`(?<![\\w$.])${escapeRegExp(n)}\\b`).test(rhs));
-      if (!tainted) continue;
+      const known = namesRegex(names); // cached until the set grows
+      if (!sourceRe.test(rhs) && !(known && known.test(rhs))) continue;
       for (const d of declaredNames(m)) {
         if (!names.has(d)) {
           names.add(d);
@@ -6170,8 +6182,8 @@ function taintedNames(text, sourceRe = SERVER_SOURCE_RE) {
 /** Does `expr` contain request data (directly or through a tainted identifier)? */
 function isTainted(expr, names, sourceRe = SERVER_SOURCE_RE) {
   if (sourceRe.test(expr)) return true;
-  for (const n of names) if (new RegExp(`(?<![\\w$.])${escapeRegExp(n)}\\b`).test(expr)) return true;
-  return false;
+  const re = namesRegex(names);
+  return Boolean(re && re.test(expr));
 }
 
 module.exports = { SERVER_SOURCE_RE, CLIENT_SOURCE_RE, taintedNames, isTainted };

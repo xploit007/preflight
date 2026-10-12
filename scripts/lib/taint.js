@@ -28,17 +28,29 @@ function declaredNames(m) {
     .filter((n) => /^[A-Za-z_$][\w$]*$/.test(n));
 }
 
+/** One regex matching any of `names` as a standalone identifier (not a property). */
+const namesRegexCache = new WeakMap();
+function namesRegex(names) {
+  if (!names.size) return null;
+  const cached = namesRegexCache.get(names);
+  if (cached && cached.size === names.size) return cached.re;
+  const re = new RegExp(`(?<![\\w$.])(?:${[...names].map(escapeRegExp).join('|')})\\b`);
+  namesRegexCache.set(names, { re, size: names.size });
+  return re;
+}
+
 /** Identifiers in `text` that hold data from `sourceRe` (default: server request data). */
 function taintedNames(text, sourceRe = SERVER_SOURCE_RE) {
   const names = new Set();
   const assign = /\b(?:const|let|var)\s+(?:([A-Za-z_$][\w$]*)|\{([^}]*)\}|\[([^\]]*)\])\s*=\s*([^;\n]+)/g;
+  const assignments = [...text.matchAll(assign)];
   for (let round = 0; round < 3; round++) {
     let changed = false;
-    for (const m of text.matchAll(assign)) {
+    for (const m of assignments) {
       const rhs = m[4];
       if (NEUTRALIZER_RE.test(rhs)) continue;
-      const tainted = sourceRe.test(rhs) || [...names].some((n) => new RegExp(`(?<![\\w$.])${escapeRegExp(n)}\\b`).test(rhs));
-      if (!tainted) continue;
+      const known = namesRegex(names); // cached until the set grows
+      if (!sourceRe.test(rhs) && !(known && known.test(rhs))) continue;
       for (const d of declaredNames(m)) {
         if (!names.has(d)) {
           names.add(d);
@@ -54,8 +66,8 @@ function taintedNames(text, sourceRe = SERVER_SOURCE_RE) {
 /** Does `expr` contain request data (directly or through a tainted identifier)? */
 function isTainted(expr, names, sourceRe = SERVER_SOURCE_RE) {
   if (sourceRe.test(expr)) return true;
-  for (const n of names) if (new RegExp(`(?<![\\w$.])${escapeRegExp(n)}\\b`).test(expr)) return true;
-  return false;
+  const re = namesRegex(names);
+  return Boolean(re && re.test(expr));
 }
 
 module.exports = { SERVER_SOURCE_RE, CLIENT_SOURCE_RE, taintedNames, isTainted };
