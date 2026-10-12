@@ -1,0 +1,6 @@
+# preflight scanning its own repo: skip the intentionally vulnerable demo apps and the
+# scanner's own pattern definitions (every regex and fix text would match itself).
+fixtures/
+scripts/
+skills/preflight/scripts/
+test/
