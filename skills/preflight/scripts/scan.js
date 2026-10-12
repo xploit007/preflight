@@ -3403,7 +3403,7 @@ function hardcodedSecrets(repo, claimed) {
       if (repo.suppressed(f, line) || localOnly(repo, f)) continue;
       add(f, line, s.google ? 'Google AI (Gemini) API key' : s.label, Boolean(s.lowImpact));
     }
-    if (f.kind === 'doc' || f.rel.endsWith('.d.ts') || /(?:^|\/)(?:locales?|i18n|lang|translations|messages)\//.test(f.rel)) continue;
+    if (f.kind === 'doc' || f.rel.endsWith('.d.ts') || repo.isMinified(f) || /(?:^|\/)(?:locales?|i18n|lang|translations|messages)\//.test(f.rel)) continue;
     for (const m of text.matchAll(P.GENERIC_ASSIGN_RE)) {
       const name = m[1];
       const value = m[3];
@@ -4952,7 +4952,7 @@ const SECRET_PATTERNS = [
   { id: 'linear-key', label: 'Linear API key', re: /\blin_api_[A-Za-z0-9]{40}\b/g },
   { id: 'doppler-token', label: 'Doppler token', re: /\bdp\.(?:pt|st|sa|ct)\.[A-Za-z0-9]{40,44}\b/g },
   { id: 'planetscale-token', label: 'PlanetScale token', re: /\bpscale_(?:tkn|pw|oauth)_[A-Za-z0-9_-]{32,64}\b/g },
-  { id: 'mapbox-secret', label: 'Mapbox secret token', re: /\bsk\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}/g },
+  { id: 'mapbox-secret', label: 'Mapbox secret token', re: /\bsk\.eyJ[A-Za-z0-9_-]{20,4096}\.[A-Za-z0-9_-]{20,1024}/g },
   // Supabase new-style secret keys and personal access tokens (service_role JWTs are decoded separately).
   { id: 'supabase-secret-key', label: 'Supabase secret API key', re: /\bsb_secret_[A-Za-z0-9_-]{20,}/g, supabaseSecret: true },
   { id: 'supabase-pat', label: 'Supabase access token', re: /\bsbp_[a-f0-9]{40}\b/g },
@@ -4964,7 +4964,7 @@ const SECRET_PATTERNS = [
 const KNOWN_EXAMPLES = new Set(['AKIAIOSFODNN7EXAMPLE', 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY']);
 
 /** Three base64url segments starting with eyJ = a JWT (Supabase anon and service_role keys are JWTs). */
-const JWT_RE = /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g;
+const JWT_RE = /\beyJ[A-Za-z0-9_-]{10,512}\.eyJ[A-Za-z0-9_-]{10,4096}\.[A-Za-z0-9_-]{10,1024}/g;
 
 /**
  * scheme://user:password@host. Group 1 scheme, 2 user, 3 password, 4 host.
@@ -4979,7 +4979,8 @@ const LOCAL_HOST_RE = /^(?:localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0|::1|\[::1\]|h
  * Generic `name = "value"` / `name: "value"` assignment where the name looks like a credential.
  * Group 1 name, 2 quote, 3 value (8–256 non-space chars).
  */
-const GENERIC_ASSIGN_RE = /\b([A-Za-z_$][\w$.-]*?(?:api[_-]?key|apikey|secret(?:[_-]?key)?|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|private[_-]?key|password|passwd|signing[_-]?key|encryption[_-]?key|webhook[_-]?secret|bearer[_-]?token))\b["']?\s*(?::|=|:=|=>)\s*(["'`])([^"'`\s]{8,256})\2/gi;
+// The name prefix is bounded ({0,40}) so long dotted/word runs in minified code can't make this quadratic.
+const GENERIC_ASSIGN_RE = /\b([A-Za-z_$][\w$.-]{0,40}?(?:api[_-]?key|apikey|secret(?:[_-]?key)?|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|private[_-]?key|password|passwd|signing[_-]?key|encryption[_-]?key|webhook[_-]?secret|bearer[_-]?token))\b["']?\s*(?::|=|:=|=>)\s*(["'`])([^"'`\s]{8,256})\2/gi;
 
 /** Names that look secret but are public by design. */
 const PUBLIC_NAME_RE = /(public|publishable|anon|site[_-]?key|client[_-]?id|recaptcha|measurement|pk_)/i;
@@ -5367,9 +5368,17 @@ function createRepo(root, opts) {
       const e = line < starts.length ? starts[line] - 1 : text.length;
       return text.slice(s, e);
     },
-    /** Redacted, clipped source line for evidence. */
+    /** Redacted, clipped source line for evidence (only a bounded window is redacted, so huge minified lines stay fast). */
     snippet(f, line, max = 120) {
-      return clip(redact(repo.lineText(f, line)), max);
+      return clip(redact(repo.lineText(f, line).slice(0, 1000)), max);
+    },
+    /** Minified/bundled-looking file: *.min.* or long average line length. Heuristics skip these. */
+    isMinified(f) {
+      if (/\.min\.[a-z]+$/.test(f.name)) return true;
+      const text = repo.read(f);
+      if (!text || text.length < 20000) return false;
+      const lines = repo.lineOf(f, text.length);
+      return text.length / lines > 400;
     },
     /** `// preflight-ignore` on the line (or the line above) suppresses findings there. */
     suppressed(f, line) {
@@ -5389,8 +5398,8 @@ function createRepo(root, opts) {
       return s;
     },
     /** Non-build source files of the given kinds (default: code + markup), optionally without tests. */
-    sources({ kinds = ['code', 'markup'], tests = true, tooling = true, js = false } = {}) {
-      return files.filter((f) => !f.build && kinds.includes(f.kind) && (tests || !repo.isTest(f)) && (tooling || !repo.isTooling(f)) && (!js || JS_EXT.has(f.ext)));
+    sources({ kinds = ['code', 'markup'], tests = true, tooling = true, js = false, minified = false } = {}) {
+      return files.filter((f) => !f.build && kinds.includes(f.kind) && (tests || !repo.isTest(f)) && (tooling || !repo.isTooling(f)) && (!js || JS_EXT.has(f.ext)) && (minified || !repo.isMinified(f)));
     },
     buildFiles() {
       return files.filter((f) => f.build);

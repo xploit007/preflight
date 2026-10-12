@@ -213,3 +213,21 @@ test('terminal escape sequences in scanned files never reach the output', () => 
   const json = scan([dir, '--json', '--offline', '--only', 'SEC-03']).json;
   assert.ok(!/[\u001b\u0007‮]/.test(json.results[0].evidence.join('')));
 });
+
+test('regex worst cases stay fast on huge minified/adversarial input', () => {
+  const word = 'abcdefghijklmnopqrstuvwxyz';
+  const inputs = [
+    Array.from({ length: 60000 }, (_, i) => word.slice(0, (i % 20) + 3)).join('.'),
+    'eyJ-'.repeat(150000),
+    'sk.eyJ-'.repeat(80000),
+    ('var a=function(e,t){return e.apiKeyValue=t,e.secretToken&&e.password_x;};').repeat(8000),
+  ];
+  for (const text of inputs) {
+    const t0 = Date.now();
+    for (const m of text.matchAll(P.GENERIC_ASSIGN_RE)) void m;
+    P.findSecrets(text);
+    P.findDbUrls(text);
+    P.redact(text.slice(0, 1000));
+    assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0}ms on ${text.slice(0, 20)}…`);
+  }
+});

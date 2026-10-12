@@ -128,9 +128,17 @@ function createRepo(root, opts) {
       const e = line < starts.length ? starts[line] - 1 : text.length;
       return text.slice(s, e);
     },
-    /** Redacted, clipped source line for evidence. */
+    /** Redacted, clipped source line for evidence (only a bounded window is redacted, so huge minified lines stay fast). */
     snippet(f, line, max = 120) {
-      return clip(redact(repo.lineText(f, line)), max);
+      return clip(redact(repo.lineText(f, line).slice(0, 1000)), max);
+    },
+    /** Minified/bundled-looking file: *.min.* or long average line length. Heuristics skip these. */
+    isMinified(f) {
+      if (/\.min\.[a-z]+$/.test(f.name)) return true;
+      const text = repo.read(f);
+      if (!text || text.length < 20000) return false;
+      const lines = repo.lineOf(f, text.length);
+      return text.length / lines > 400;
     },
     /** `// preflight-ignore` on the line (or the line above) suppresses findings there. */
     suppressed(f, line) {
@@ -150,8 +158,8 @@ function createRepo(root, opts) {
       return s;
     },
     /** Non-build source files of the given kinds (default: code + markup), optionally without tests. */
-    sources({ kinds = ['code', 'markup'], tests = true, tooling = true, js = false } = {}) {
-      return files.filter((f) => !f.build && kinds.includes(f.kind) && (tests || !repo.isTest(f)) && (tooling || !repo.isTooling(f)) && (!js || JS_EXT.has(f.ext)));
+    sources({ kinds = ['code', 'markup'], tests = true, tooling = true, js = false, minified = false } = {}) {
+      return files.filter((f) => !f.build && kinds.includes(f.kind) && (tests || !repo.isTest(f)) && (tooling || !repo.isTooling(f)) && (!js || JS_EXT.has(f.ext)) && (minified || !repo.isMinified(f)));
     },
     buildFiles() {
       return files.filter((f) => f.build);

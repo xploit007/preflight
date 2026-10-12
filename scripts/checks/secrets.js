@@ -128,7 +128,7 @@ function hardcodedSecrets(repo, claimed) {
       if (repo.suppressed(f, line) || localOnly(repo, f)) continue;
       add(f, line, s.google ? 'Google AI (Gemini) API key' : s.label, Boolean(s.lowImpact));
     }
-    if (f.kind === 'doc' || f.rel.endsWith('.d.ts') || /(?:^|\/)(?:locales?|i18n|lang|translations|messages)\//.test(f.rel)) continue;
+    if (f.kind === 'doc' || f.rel.endsWith('.d.ts') || repo.isMinified(f) || /(?:^|\/)(?:locales?|i18n|lang|translations|messages)\//.test(f.rel)) continue;
     for (const m of text.matchAll(P.GENERIC_ASSIGN_RE)) {
       const name = m[1];
       const value = m[3];
