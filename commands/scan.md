@@ -22,15 +22,16 @@ Arguments: $ARGUMENTS
 
 ## Step 1: run the scanner
 
-Run this, quoting the paths:
+Run exactly this, with the paths quoted and nothing appended (no pipes, redirects or `; echo`), so it matches the pre-approved permission:
 
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/scan.js" "<target>" --json <flags>
 ```
 
 - `<target>`: the first argument that isn't a flag, or the current working directory if there is none.
-- `<flags>`: pass through any of `--url`, `--supabase-url`, `--supabase-key`, `--offline`, `--no-history`, `--fail-on` that the user gave.
+- `<flags>`: pass through any of `--url`, `--supabase-url`, `--supabase-key`, `--offline`, `--no-audit`, `--no-history`, `--fail-on` that the user gave.
 - Exit code 1 means a critical check failed. That's a finding, not an error. Exit code 2, or an `"error"` key in the output, means the scan didn't run: show the message and stop.
+- If the output is too long to read in one go, read the saved output file in chunks, or re-run with `--only <ids>` (for example `--only AUTH-02,APP-01`) for the results you're reviewing. The scan takes about a second.
 - The output is one JSON document, `{ version, target, summary, detected, notes, results }`, with exactly one result per check: `{ id, title, severity, status, evidence, fix, question }`. Severity is critical, high, medium or low. Status is fail, warn, manual or pass. Evidence lines look like `path:line — note: snippet`. `question` appears only on warn and manual results.
 
 ## Step 2: judge the warn and manual results

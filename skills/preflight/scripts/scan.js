@@ -57,6 +57,7 @@ Usage: node scripts/scan.js [path] [options]
   --supabase-url <url>     Supabase project URL for the live RLS read test
   --supabase-key <key>     the project's anon/publishable key (service-role keys are refused)
   --offline                skip everything that needs the network (npm audit, live checks)
+  --no-audit               skip npm audit only (live checks still run when requested)
   --no-history             skip the git history secret scan
   --history-depth <n>      commits of history to scan (default 200)
   --only <groups>          comma-separated groups or check ids (e.g. secrets,env or SEC-02)
@@ -78,6 +79,7 @@ function parseArgs(argv) {
     supabaseUrl: null,
     supabaseKey: null,
     offline: false,
+    audit: true,
     history: true,
     historyDepth: 200,
     only: null,
@@ -111,6 +113,9 @@ function parseArgs(argv) {
         break;
       case '--offline':
         opts.offline = true;
+        break;
+      case '--no-audit':
+        opts.audit = false;
         break;
       case '--no-history':
         opts.history = false;
@@ -299,6 +304,7 @@ async function scan(opts) {
       url: opts.url,
       supabaseLive: Boolean(opts.supabaseUrl && opts.supabaseKey),
       offline: opts.offline,
+      audit: opts.audit && !opts.offline,
       history: opts.history ? opts.historyDepth : 0,
       only: opts.only,
     },
@@ -2125,7 +2131,7 @@ async function audit({ repo, pkgs, opts }) {
     if (lock) roots.set(lock.dir, lock);
   }
   if (!roots.size) return manual('DEP-01', ['npm audit needs a lockfile and there is none (see DEP-02). Generate one, then re-run.']);
-  if (opts.offline) return manual('DEP-01', ['Skipped: --offline. Run `npm audit --audit-level=high` (or pnpm/yarn/bun audit) with network access.']);
+  if (opts.offline || opts.audit === false) return manual('DEP-01', [`Skipped: ${opts.offline ? '--offline' : '--no-audit'}. Run \`npm audit --audit-level=high\` (or pnpm/yarn/bun audit) with network access.`]);
   const evidence = [];
   const prod = [];
   const dev = [];

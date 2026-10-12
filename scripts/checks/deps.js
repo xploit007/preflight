@@ -191,7 +191,7 @@ async function audit({ repo, pkgs, opts }) {
     if (lock) roots.set(lock.dir, lock);
   }
   if (!roots.size) return manual('DEP-01', ['npm audit needs a lockfile and there is none (see DEP-02). Generate one, then re-run.']);
-  if (opts.offline) return manual('DEP-01', ['Skipped: --offline. Run `npm audit --audit-level=high` (or pnpm/yarn/bun audit) with network access.']);
+  if (opts.offline || opts.audit === false) return manual('DEP-01', [`Skipped: ${opts.offline ? '--offline' : '--no-audit'}. Run \`npm audit --audit-level=high\` (or pnpm/yarn/bun audit) with network access.`]);
   const evidence = [];
   const prod = [];
   const dev = [];

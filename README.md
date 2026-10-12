@@ -60,6 +60,7 @@ node scripts/scan.js [path] [options]
   --supabase-url <url>     Supabase project URL for the live RLS read test
   --supabase-key <key>     the anon/publishable key (service-role keys are refused)
   --offline                skip npm audit and live checks
+  --no-audit               skip npm audit only
   --no-history             skip the git history secret scan
   --history-depth <n>      commits of history to scan (default 200)
   --only <groups|ids>      e.g. --only secrets,env or --only DATA-01
