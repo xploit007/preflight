@@ -1,0 +1,2 @@
+2025-01-01T09:00:00.000Z POST /api/login {"email":"demo@shipnotes.dev","password":"hunter22"}
+2025-01-01T09:00:01.000Z POST /api/sms/send {"phone":"+15555550123","message":"Your code is 482913"}

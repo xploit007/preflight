@@ -1,0 +1,1 @@
+{"version":3,"file":"index-4f9c2d1a.js","sources":["../../src/lib/ai.js"],"sourcesContent":["import OpenAI from 'openai';\n\nconst openai = new OpenAI({ apiKey: 'sk-proj-PreflightFakeOpenAIKeyDoNotUse0000000000', dangerouslyAllowBrowser: true });\n"],"names":["e","t","n"],"mappings":"AAAA,MAAM,EAAE"}
