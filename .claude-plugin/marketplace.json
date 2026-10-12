@@ -1,0 +1,22 @@
+{
+  "name": "preflight",
+  "description": "preflight: a pre-launch security and cost-risk scanner for vibe-coded web apps",
+  "owner": {
+    "name": "xploit007"
+  },
+  "plugins": [
+    {
+      "name": "preflight",
+      "source": "./",
+      "description": "Pre-launch security and cost-risk scanner for vibe-coded web apps",
+      "author": {
+        "name": "xploit007"
+      },
+      "homepage": "https://github.com/REPLACE-WITH-GITHUB-OWNER/preflight",
+      "repository": "https://github.com/REPLACE-WITH-GITHUB-OWNER/preflight",
+      "license": "MIT",
+      "keywords": ["security", "pre-launch", "supabase", "secrets", "audit", "vibe-coding"],
+      "category": "security"
+    }
+  ]
+}
