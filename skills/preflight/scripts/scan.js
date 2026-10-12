@@ -453,6 +453,7 @@ function smokeTest(repo) {
     }
     for (const t of tags(text, 'input|select|textarea')) {
       if (/\btype\s*=\s*["'](?:hidden|submit|button|reset|image)["']/.test(t.tag)) continue;
+      if (/\s(?:hidden|aria-hidden\s*=\s*["'{]?true)(?=[\s/>={])/.test(t.tag) && !/\bhidden\s*=\s*\{?\s*false/.test(t.tag)) continue;
       counts.inputs++;
       if (ARIA_NAME_RE.test(t.tag)) continue;
       const id = (/\bid\s*=\s*["']([^"']+)["']/.exec(t.tag) || [])[1];
@@ -1011,7 +1012,7 @@ const { collectColumns } = require('./data');
 const IDS = ['AUTH-01', 'AUTH-02', 'AUTH-03', 'AUTH-04', 'AUTH-05', 'AUTH-06', 'AUTH-07', 'AUTH-08', 'AUTH-09', 'AUTH-10'];
 
 // Routes that are public by design (auth flows, webhooks with signatures, health checks, public forms).
-const PUBLIC_PATH_RE = /(?:^|\/)(?:login|log-in|logout|signin|sign-in|signup|sign-up|register|auth|oauth|callback|forgot[\w-]*|reset[\w-]*|verify[\w-]*|confirm[\w-]*|magic[\w-]*|otp|webhooks?|[\w-]*webhook[\w-]*|health|healthz|status|ping|ready|version|robots\.txt|sitemap[\w.]*|og|contact|subscribe|newsletter|waitlist|unsubscribe|csp-report|cron)(?:\/|$|\.)/i;
+const PUBLIC_PATH_RE = /(?:^|\/)(?:login|log-in|logout|signin|sign-in|signup|sign-up|register|join|auth|oauth|callback|forgot[\w-]*|reset[\w-]*|verify[\w-]*|confirm[\w-]*|magic[\w-]*|otp|webhooks?|[\w-]*webhook[\w-]*|health|healthz|status|ping|ready|version|robots\.txt|sitemap[\w.]*|og|contact|subscribe|newsletter|waitlist|unsubscribe|csp-report|cron)(?:\/|$|\.)/i;
 const SENSITIVE_GET_RE = /(?:^|\/)(?:users?|me|account|accounts|admin|orders?|payments?|invoices?|billing|profiles?|messages?|settings|customers?|notes|documents|files|exports?|reports?|subscriptions?|transactions?|conversations?|chats?)(?:\/|$)/i;
 const ADMIN_PATH_RE = /(?:^|\/)(?:admin|internal|staff|superuser|super-admin|backoffice|back-office|moderation|moderator|ops)(?:\/|$)/i;
 const MANAGED_AUTH_RE = /\bsupabase\.auth\.|\.auth\.(?:getUser|getSession|signInWith\w+|signUp)\b|@clerk\/|next-auth|@auth\/|firebase\/auth|firebase-admin\/auth|getAuth\(|@auth0\/|better-auth|\blucia\b|@kinde-oss\/|@workos-inc\/|@stackframe\/|@descope\/|supertokens|aws-amplify|@stytch\//;
@@ -1733,8 +1734,9 @@ function openRules(repo) {
     if (/(?:^|\/)(?:[\w.-]*\.)?(?:firestore|storage)\.rules$|\.rules$/.test(f.rel) && /\ballow\b/.test(text)) {
       checkedSomething = true;
       const kind = /storage/.test(f.name) ? 'Storage' : 'Firestore';
-      for (const m of text.matchAll(/\ballow\s+([\w\s,]+?)\s*:\s*if\s+true\s*;/g)) add(bad, f, m.index, `${kind} rule allows ${m[1].trim()} for everyone (if true)`);
-      for (const m of text.matchAll(/\ballow\s+([\w\s,]+?)\s*;/g)) add(bad, f, m.index, `${kind} rule allows ${m[1].trim()} with no condition at all`);
+      const writes = (ops) => /\b(?:write|create|update|delete)\b/.test(ops);
+      for (const m of text.matchAll(/\ballow\s+([\w\s,]+?)\s*:\s*if\s+true\s*;/g)) add(writes(m[1]) ? bad : soft, f, m.index, `${kind} rule allows ${m[1].trim()} for everyone (if true)${writes(m[1]) ? '' : ': fine for public data, a leak for anything else'}`);
+      for (const m of text.matchAll(/\ballow\s+([\w\s,]+?)\s*;/g)) add(writes(m[1]) ? bad : soft, f, m.index, `${kind} rule allows ${m[1].trim()} with no condition at all${writes(m[1]) ? '' : ': fine for public data, a leak for anything else'}`);
       for (const m of text.matchAll(/\bif\s+request\.time\s*<\s*timestamp\.date\(/g)) add(bad, f, m.index, `${kind} is still on test-mode rules: open to everyone until the date passes`);
       for (const m of text.matchAll(/\ballow\s+([\w\s,]+?)\s*:\s*if\s+request\.auth\s*!=\s*null\s*;/g)) add(soft, f, m.index, `${kind} rule lets any signed-in user ${m[1].trim()} every document it matches (no ownership check)`);
     }
@@ -2335,6 +2337,15 @@ function secretLabel(e) {
   return null;
 }
 
+/** Like secretLabel, but only provider formats and DB URLs with real passwords. */
+function strongLabel(e) {
+  if (!e.value || P.isPlaceholder(e.value)) return null;
+  const hit = P.findSecrets(e.value)[0];
+  if (hit && !hit.google) return hit.label;
+  if (P.findDbUrls(e.value).some((d) => !d.placeholder && !d.local)) return 'database URL with a password';
+  return null;
+}
+
 function envFilesCheck(repo) {
   const files = repo.envFiles();
   if (!files.length) return na('SEC-02', 'no .env files in the repo');
@@ -2344,10 +2355,12 @@ function envFilesCheck(repo) {
   const hasGitignore = Boolean(repo.get('.gitignore'));
   for (const f of files) {
     const entries = parseEnv(repo.read(f));
-    const secrets = entries.map((e) => ({ e, label: secretLabel(e) })).filter((x) => x.label);
+    const example = repo.isEnvExample(f);
+    // Example files hold placeholders by design: only provider-format secrets and real DB URLs count there.
+    const secrets = entries.map((e) => ({ e, label: example ? strongLabel(e) : secretLabel(e) })).filter((x) => x.label);
     const line = secrets.length ? secrets[0].e.line : 1;
     const holds = secrets.length ? `holds ${secrets.length} secret-looking value${secrets.length > 1 ? 's' : ''} (first: ${secrets[0].label}, line ${secrets[0].e.line})` : 'holds no secret-looking values right now';
-    if (repo.isEnvExample(f)) {
+    if (example) {
       if (secrets.length) failing.push(ev(f.rel, line, `example env file contains a real-looking secret (${secrets[0].label}); example files are committed and public`));
       else fine.push(ev(f.rel, null, 'example file with placeholders only (fine to commit)'));
       continue;
@@ -3252,6 +3265,7 @@ const { loadRepo, ENV_FILE_RE } = require('../lib/repo');
 const P = require('../lib/patterns');
 const { pass, fail, warn, na, ev } = require('../lib/result');
 const { splitArgs, literalValue, isCommentLine, escapeRegExp } = require('../lib/util');
+const { parseEnv, secretLabel } = require('./env');
 
 const IDS = ['SEC-01', 'SEC-03', 'SEC-04', 'SEC-05', 'SEC-06', 'SEC-07'];
 
@@ -3506,7 +3520,12 @@ function historyFindings(repo, opts) {
         if (line.startsWith('\0')) header = line.slice(1).trim();
         else if (line.trim()) {
           const base = path.posix.basename(line.trim());
-          if (ENV_FILE_RE.test(base) && !/(?:example|sample|template|dist|defaults|schema)/i.test(base)) envAdds.push({ file: line.trim(), header });
+          if (!ENV_FILE_RE.test(base) || /(?:example|sample|template|dist|defaults|schema)/i.test(base)) continue;
+          // Only env files that held secret-looking values count (public config like NEXT_PUBLIC_* is fine).
+          const sha = header.split(' ')[0];
+          const content = repo.git.run(['show', `${sha}:./${line.trim()}`]) || '';
+          const secrets = parseEnv(content).filter((e) => secretLabel(e));
+          if (secrets.length) envAdds.push({ file: line.trim(), header, count: secrets.length });
         }
       }
     }
@@ -3527,7 +3546,7 @@ async function gitHistory(repo, opts) {
   if (h.skipped) return pass('SEC-04', [`Not checked: ${h.skipped}.`]);
   if (h.na) return na('SEC-04', h.na);
   const evidence = [...h.found.values()].map((x) => historyEvidence(repo, x));
-  for (const a of h.envAdds) evidence.push(ev(a.file, null, `env file committed in ${a.header}; every value in it is readable in history`));
+  for (const a of h.envAdds) evidence.push(ev(a.file, null, `env file with ${a.count} secret-looking value${a.count > 1 ? 's' : ''} committed in ${a.header}; every value in it is readable in history`));
   if (h.truncated) evidence.push(`History scan stopped early (time/size budget); scanned ${h.commits} commits.`);
   if (h.found.size || h.envAdds.length) {
     if ([...h.found.values()].every((x) => x.lowImpact) && !h.envAdds.length) return warn('SEC-04', evidence, { question: 'Only test-mode keys were found in history. Confirm they are test keys.' });
@@ -5249,7 +5268,7 @@ const SERVER_IMPORT_RE = /(?:require\(\s*|\bfrom\s+|\bimport\s+)['"](?:node:)?(?
 const CLIENT_SIGNAL_RE = /\b(?:window|document|localStorage|sessionStorage|navigator)\.|\buse(?:State|Effect|LayoutEffect|Ref|Reducer|Context|Navigate|Router|SearchParams|Query|Mutation)\s*\(|import\.meta\.env\.VITE_|\bonClick\s*=|\bfrom\s+['"](?:react-dom(?:\/client)?|react-router(?:-dom)?|@stripe\/stripe-js|@stripe\/react-stripe-js)['"]/;
 const TEST_PATH_RE = /(?:^|\/)(?:__tests__|__mocks__|tests?|spec|specs|e2e|cypress|playwright|fixtures?|mocks?|stories|\.storybook)\/|\.(?:test|spec|stories|e2e)\.[cm]?[jt]sx?$|(?:^|\/)test_[^/]*\.py$|_test\.(?:py|go)$/;
 // Tooling that runs on a developer machine or in CI, not in the deployed app.
-const TOOLING_PATH_RE = /(?:^|\/)(?:scripts|tools|bin|\.github|\.husky|config|migrations|seed|seeds)\/|(?:^|\/)[\w.-]+\.config\.[cm]?[jt]s$|(?:^|\/)(?:gulpfile|gruntfile|webpack|rollup|vite|next|nuxt|svelte|astro|tailwind|postcss|babel|jest|vitest|playwright|eslint|prettier)\.[\w.]*$/i;
+const TOOLING_PATH_RE = /(?:^|\/)(?:scripts|tools|bin|\.github|\.husky|config|migrations|seed|seeds|remix\.init|management\/commands|cli)\/|(?:^|\/)(?:cli|manage)\.(?:py|[cm]?[jt]s)$|(?:^|\/)[\w.-]+\.config\.[cm]?[jt]s$|(?:^|\/)(?:gulpfile|gruntfile|webpack|rollup|vite|next|nuxt|svelte|astro|tailwind|postcss|babel|jest|vitest|playwright|eslint|prettier)\.[\w.]*$/i;
 
 const cache = new Map();
 

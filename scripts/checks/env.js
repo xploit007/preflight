@@ -52,6 +52,15 @@ function secretLabel(e) {
   return null;
 }
 
+/** Like secretLabel, but only provider formats and DB URLs with real passwords. */
+function strongLabel(e) {
+  if (!e.value || P.isPlaceholder(e.value)) return null;
+  const hit = P.findSecrets(e.value)[0];
+  if (hit && !hit.google) return hit.label;
+  if (P.findDbUrls(e.value).some((d) => !d.placeholder && !d.local)) return 'database URL with a password';
+  return null;
+}
+
 function envFilesCheck(repo) {
   const files = repo.envFiles();
   if (!files.length) return na('SEC-02', 'no .env files in the repo');
@@ -61,10 +70,12 @@ function envFilesCheck(repo) {
   const hasGitignore = Boolean(repo.get('.gitignore'));
   for (const f of files) {
     const entries = parseEnv(repo.read(f));
-    const secrets = entries.map((e) => ({ e, label: secretLabel(e) })).filter((x) => x.label);
+    const example = repo.isEnvExample(f);
+    // Example files hold placeholders by design: only provider-format secrets and real DB URLs count there.
+    const secrets = entries.map((e) => ({ e, label: example ? strongLabel(e) : secretLabel(e) })).filter((x) => x.label);
     const line = secrets.length ? secrets[0].e.line : 1;
     const holds = secrets.length ? `holds ${secrets.length} secret-looking value${secrets.length > 1 ? 's' : ''} (first: ${secrets[0].label}, line ${secrets[0].e.line})` : 'holds no secret-looking values right now';
-    if (repo.isEnvExample(f)) {
+    if (example) {
       if (secrets.length) failing.push(ev(f.rel, line, `example env file contains a real-looking secret (${secrets[0].label}); example files are committed and public`));
       else fine.push(ev(f.rel, null, 'example file with placeholders only (fine to commit)'));
       continue;

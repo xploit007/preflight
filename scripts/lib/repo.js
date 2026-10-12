@@ -52,7 +52,7 @@ const SERVER_IMPORT_RE = /(?:require\(\s*|\bfrom\s+|\bimport\s+)['"](?:node:)?(?
 const CLIENT_SIGNAL_RE = /\b(?:window|document|localStorage|sessionStorage|navigator)\.|\buse(?:State|Effect|LayoutEffect|Ref|Reducer|Context|Navigate|Router|SearchParams|Query|Mutation)\s*\(|import\.meta\.env\.VITE_|\bonClick\s*=|\bfrom\s+['"](?:react-dom(?:\/client)?|react-router(?:-dom)?|@stripe\/stripe-js|@stripe\/react-stripe-js)['"]/;
 const TEST_PATH_RE = /(?:^|\/)(?:__tests__|__mocks__|tests?|spec|specs|e2e|cypress|playwright|fixtures?|mocks?|stories|\.storybook)\/|\.(?:test|spec|stories|e2e)\.[cm]?[jt]sx?$|(?:^|\/)test_[^/]*\.py$|_test\.(?:py|go)$/;
 // Tooling that runs on a developer machine or in CI, not in the deployed app.
-const TOOLING_PATH_RE = /(?:^|\/)(?:scripts|tools|bin|\.github|\.husky|config|migrations|seed|seeds)\/|(?:^|\/)[\w.-]+\.config\.[cm]?[jt]s$|(?:^|\/)(?:gulpfile|gruntfile|webpack|rollup|vite|next|nuxt|svelte|astro|tailwind|postcss|babel|jest|vitest|playwright|eslint|prettier)\.[\w.]*$/i;
+const TOOLING_PATH_RE = /(?:^|\/)(?:scripts|tools|bin|\.github|\.husky|config|migrations|seed|seeds|remix\.init|management\/commands|cli)\/|(?:^|\/)(?:cli|manage)\.(?:py|[cm]?[jt]s)$|(?:^|\/)[\w.-]+\.config\.[cm]?[jt]s$|(?:^|\/)(?:gulpfile|gruntfile|webpack|rollup|vite|next|nuxt|svelte|astro|tailwind|postcss|babel|jest|vitest|playwright|eslint|prettier)\.[\w.]*$/i;
 
 const cache = new Map();
 

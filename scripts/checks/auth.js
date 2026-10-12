@@ -18,7 +18,7 @@ const { collectColumns } = require('./data');
 const IDS = ['AUTH-01', 'AUTH-02', 'AUTH-03', 'AUTH-04', 'AUTH-05', 'AUTH-06', 'AUTH-07', 'AUTH-08', 'AUTH-09', 'AUTH-10'];
 
 // Routes that are public by design (auth flows, webhooks with signatures, health checks, public forms).
-const PUBLIC_PATH_RE = /(?:^|\/)(?:login|log-in|logout|signin|sign-in|signup|sign-up|register|auth|oauth|callback|forgot[\w-]*|reset[\w-]*|verify[\w-]*|confirm[\w-]*|magic[\w-]*|otp|webhooks?|[\w-]*webhook[\w-]*|health|healthz|status|ping|ready|version|robots\.txt|sitemap[\w.]*|og|contact|subscribe|newsletter|waitlist|unsubscribe|csp-report|cron)(?:\/|$|\.)/i;
+const PUBLIC_PATH_RE = /(?:^|\/)(?:login|log-in|logout|signin|sign-in|signup|sign-up|register|join|auth|oauth|callback|forgot[\w-]*|reset[\w-]*|verify[\w-]*|confirm[\w-]*|magic[\w-]*|otp|webhooks?|[\w-]*webhook[\w-]*|health|healthz|status|ping|ready|version|robots\.txt|sitemap[\w.]*|og|contact|subscribe|newsletter|waitlist|unsubscribe|csp-report|cron)(?:\/|$|\.)/i;
 const SENSITIVE_GET_RE = /(?:^|\/)(?:users?|me|account|accounts|admin|orders?|payments?|invoices?|billing|profiles?|messages?|settings|customers?|notes|documents|files|exports?|reports?|subscriptions?|transactions?|conversations?|chats?)(?:\/|$)/i;
 const ADMIN_PATH_RE = /(?:^|\/)(?:admin|internal|staff|superuser|super-admin|backoffice|back-office|moderation|moderator|ops)(?:\/|$)/i;
 const MANAGED_AUTH_RE = /\bsupabase\.auth\.|\.auth\.(?:getUser|getSession|signInWith\w+|signUp)\b|@clerk\/|next-auth|@auth\/|firebase\/auth|firebase-admin\/auth|getAuth\(|@auth0\/|better-auth|\blucia\b|@kinde-oss\/|@workos-inc\/|@stackframe\/|@descope\/|supertokens|aws-amplify|@stytch\//;

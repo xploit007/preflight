@@ -12,6 +12,7 @@ const { loadRepo, ENV_FILE_RE } = require('../lib/repo');
 const P = require('../lib/patterns');
 const { pass, fail, warn, na, ev } = require('../lib/result');
 const { splitArgs, literalValue, isCommentLine, escapeRegExp } = require('../lib/util');
+const { parseEnv, secretLabel } = require('./env');
 
 const IDS = ['SEC-01', 'SEC-03', 'SEC-04', 'SEC-05', 'SEC-06', 'SEC-07'];
 
@@ -266,7 +267,12 @@ function historyFindings(repo, opts) {
         if (line.startsWith('\0')) header = line.slice(1).trim();
         else if (line.trim()) {
           const base = path.posix.basename(line.trim());
-          if (ENV_FILE_RE.test(base) && !/(?:example|sample|template|dist|defaults|schema)/i.test(base)) envAdds.push({ file: line.trim(), header });
+          if (!ENV_FILE_RE.test(base) || /(?:example|sample|template|dist|defaults|schema)/i.test(base)) continue;
+          // Only env files that held secret-looking values count (public config like NEXT_PUBLIC_* is fine).
+          const sha = header.split(' ')[0];
+          const content = repo.git.run(['show', `${sha}:./${line.trim()}`]) || '';
+          const secrets = parseEnv(content).filter((e) => secretLabel(e));
+          if (secrets.length) envAdds.push({ file: line.trim(), header, count: secrets.length });
         }
       }
     }
@@ -287,7 +293,7 @@ async function gitHistory(repo, opts) {
   if (h.skipped) return pass('SEC-04', [`Not checked: ${h.skipped}.`]);
   if (h.na) return na('SEC-04', h.na);
   const evidence = [...h.found.values()].map((x) => historyEvidence(repo, x));
-  for (const a of h.envAdds) evidence.push(ev(a.file, null, `env file committed in ${a.header}; every value in it is readable in history`));
+  for (const a of h.envAdds) evidence.push(ev(a.file, null, `env file with ${a.count} secret-looking value${a.count > 1 ? 's' : ''} committed in ${a.header}; every value in it is readable in history`));
   if (h.truncated) evidence.push(`History scan stopped early (time/size budget); scanned ${h.commits} commits.`);
   if (h.found.size || h.envAdds.length) {
     if ([...h.found.values()].every((x) => x.lowImpact) && !h.envAdds.length) return warn('SEC-04', evidence, { question: 'Only test-mode keys were found in history. Confirm they are test keys.' });

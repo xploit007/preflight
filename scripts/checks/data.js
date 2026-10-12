@@ -104,8 +104,9 @@ function openRules(repo) {
     if (/(?:^|\/)(?:[\w.-]*\.)?(?:firestore|storage)\.rules$|\.rules$/.test(f.rel) && /\ballow\b/.test(text)) {
       checkedSomething = true;
       const kind = /storage/.test(f.name) ? 'Storage' : 'Firestore';
-      for (const m of text.matchAll(/\ballow\s+([\w\s,]+?)\s*:\s*if\s+true\s*;/g)) add(bad, f, m.index, `${kind} rule allows ${m[1].trim()} for everyone (if true)`);
-      for (const m of text.matchAll(/\ballow\s+([\w\s,]+?)\s*;/g)) add(bad, f, m.index, `${kind} rule allows ${m[1].trim()} with no condition at all`);
+      const writes = (ops) => /\b(?:write|create|update|delete)\b/.test(ops);
+      for (const m of text.matchAll(/\ballow\s+([\w\s,]+?)\s*:\s*if\s+true\s*;/g)) add(writes(m[1]) ? bad : soft, f, m.index, `${kind} rule allows ${m[1].trim()} for everyone (if true)${writes(m[1]) ? '' : ': fine for public data, a leak for anything else'}`);
+      for (const m of text.matchAll(/\ballow\s+([\w\s,]+?)\s*;/g)) add(writes(m[1]) ? bad : soft, f, m.index, `${kind} rule allows ${m[1].trim()} with no condition at all${writes(m[1]) ? '' : ': fine for public data, a leak for anything else'}`);
       for (const m of text.matchAll(/\bif\s+request\.time\s*<\s*timestamp\.date\(/g)) add(bad, f, m.index, `${kind} is still on test-mode rules: open to everyone until the date passes`);
       for (const m of text.matchAll(/\ballow\s+([\w\s,]+?)\s*:\s*if\s+request\.auth\s*!=\s*null\s*;/g)) add(soft, f, m.index, `${kind} rule lets any signed-in user ${m[1].trim()} every document it matches (no ownership check)`);
     }

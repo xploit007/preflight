@@ -100,6 +100,7 @@ function smokeTest(repo) {
     }
     for (const t of tags(text, 'input|select|textarea')) {
       if (/\btype\s*=\s*["'](?:hidden|submit|button|reset|image)["']/.test(t.tag)) continue;
+      if (/\s(?:hidden|aria-hidden\s*=\s*["'{]?true)(?=[\s/>={])/.test(t.tag) && !/\bhidden\s*=\s*\{?\s*false/.test(t.tag)) continue;
       counts.inputs++;
       if (ARIA_NAME_RE.test(t.tag)) continue;
       const id = (/\bid\s*=\s*["']([^"']+)["']/.exec(t.tag) || [])[1];
