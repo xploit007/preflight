@@ -1,0 +1,6 @@
+node_modules/
+.context/
+.DS_Store
+*.log
+!fixtures/**/*.log
+coverage/

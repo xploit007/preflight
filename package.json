@@ -1,0 +1,37 @@
+{
+  "name": "preflight",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pre-launch security and cost-risk scanner for vibe-coded web apps",
+  "license": "MIT",
+  "author": "xploit007",
+  "homepage": "https://github.com/xploit007/preflight#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xploit007/preflight.git"
+  },
+  "keywords": [
+    "claude-code",
+    "claude-code-plugin",
+    "agent-skills",
+    "security",
+    "pre-launch",
+    "supabase",
+    "row-level-security",
+    "secrets",
+    "vibe-coding"
+  ],
+  "bin": {
+    "preflight": "scripts/scan.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node scripts/scan.js ./fixtures/vulnerable",
+    "scan": "node scripts/scan.js",
+    "verify": "node test/run.js",
+    "build": "node tools/gen-docs.js && node tools/build-skill.js",
+    "check": "node tools/gen-docs.js --check && node tools/build-skill.js --check"
+  }
+}

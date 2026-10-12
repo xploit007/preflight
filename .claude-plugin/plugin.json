@@ -1,0 +1,10 @@
+{
+  "name": "preflight",
+  "description": "Pre-launch security and cost-risk scanner for vibe-coded web apps",
+  "version": "0.1.0",
+  "author": {
+    "name": "xploit007"
+  },
+  "license": "MIT",
+  "keywords": ["security", "pre-launch", "supabase", "secrets", "audit", "vibe-coding"]
+}
