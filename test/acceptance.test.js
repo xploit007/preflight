@@ -123,6 +123,8 @@ test('README install commands match the repo layout', () => {
   assert.equal(install[2], market.name);
   assert.equal(plugin.name, market.plugins[0].name);
   assert.equal(market.plugins[0].source, './');
+  assert.equal(market.plugins[0].repository, 'https://github.com/xploit007/preflight');
+  assert.equal(market.plugins[0].homepage, market.plugins[0].repository);
   // npx skills add … --skill preflight → skills/preflight/SKILL.md with name: preflight
   assert.ok(readme.includes('npx skills add https://github.com/xploit007/preflight --skill preflight'));
   const skill = fs.readFileSync(path.join(ROOT, 'skills', 'preflight', 'SKILL.md'), 'utf8');

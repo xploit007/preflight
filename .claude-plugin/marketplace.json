@@ -12,8 +12,8 @@
       "author": {
         "name": "xploit007"
       },
-      "homepage": "https://github.com/REPLACE-WITH-GITHUB-OWNER/preflight",
-      "repository": "https://github.com/REPLACE-WITH-GITHUB-OWNER/preflight",
+      "homepage": "https://github.com/xploit007/preflight",
+      "repository": "https://github.com/xploit007/preflight",
       "license": "MIT",
       "keywords": ["security", "pre-launch", "supabase", "secrets", "audit", "vibe-coding"],
       "category": "security"
