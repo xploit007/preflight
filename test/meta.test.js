@@ -32,7 +32,7 @@ test('package.json test script runs the scanner on the vulnerable fixture', () =
   assert.equal(JSON.parse(read('package.json')).scripts.test, 'node scripts/scan.js ./fixtures/vulnerable');
 });
 
-test('generated files are up to date (checklist, README table, command, skill, bundle)', () => {
+test('generated files are up to date (checklist, command, skill, bundle)', () => {
   for (const tool of ['tools/gen-docs.js', 'tools/build-skill.js']) {
     const res = spawnSync(process.execPath, [path.join(ROOT, tool), '--check'], { cwd: ROOT, encoding: 'utf8' });
     assert.equal(res.status, 0, `${tool} --check: ${res.stderr}`);

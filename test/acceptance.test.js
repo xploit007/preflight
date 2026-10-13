@@ -8,7 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const { ROOT, scan, isTracked, pointsAt, schemaProblems, tempCopy, byId } = require('./helpers');
 const planted = require('./planted.json');
-const { CHECKS } = require('../scripts/lib/catalog');
+const { CHECKS, GROUPS } = require('../scripts/lib/catalog');
 
 const VULN = 'fixtures/vulnerable';
 const CLEAN = 'fixtures/clean';
@@ -106,9 +106,9 @@ test('no runtime dependencies: runs from a bare copy of scripts/ with no node_mo
   assert.equal(res2.json.results.length, CHECKS.length);
 });
 
-test('scan of the vulnerable fixture completes in under 60 seconds', () => {
+test('scan of the vulnerable fixture completes in under 30 seconds (the README tagline)', () => {
   const res = scan(['./fixtures/vulnerable', '--json']);
-  assert.ok(res.ms < 60000, `took ${res.ms}ms`);
+  assert.ok(res.ms < 30000, `took ${res.ms}ms`);
 });
 
 test('README install commands match the repo layout', () => {
@@ -129,16 +129,22 @@ test('README install commands match the repo layout', () => {
   assert.ok(readme.includes('npx skills add https://github.com/xploit007/preflight --skill preflight'));
   const skill = fs.readFileSync(path.join(ROOT, 'skills', 'preflight', 'SKILL.md'), 'utf8');
   assert.match(skill, /^---\nname: preflight\n/);
-  // Every repo path the README links or names exists.
-  for (const rel of ['skills/preflight/references/checklist.md', 'skills/preflight/SKILL.md', 'scripts/scan.js', 'commands/scan.md', 'LICENSE', 'scripts/lib/catalog.js', 'test/planted.json', 'fixtures/vulnerable', 'fixtures/clean', '.github/secret_scanning.yml']) {
-    assert.ok(fs.existsSync(path.join(ROOT, rel)), `${rel} is referenced but missing`);
+  // Every relative link and image in the docs resolves (no broken image or link on github.com).
+  for (const doc of ['README.md', 'CONTRIBUTING.md', 'docs/usage.md']) {
+    const text = fs.readFileSync(path.join(ROOT, doc), 'utf8').replace(/```[\s\S]*?```/g, '');
+    for (const m of text.matchAll(/!?\[[^\]]*\]\(([^)\s]+)\)/g)) {
+      if (/^(?:https?:|mailto:|#)/.test(m[1])) continue;
+      const target = path.join(ROOT, path.dirname(doc), m[1].split('#')[0]);
+      assert.ok(fs.existsSync(target), `${doc} links to ${m[1]}, which is missing`);
+    }
   }
+  assert.ok(readme.includes('](assets/demo.gif)'), 'README embeds the demo GIF by relative path');
   assert.ok(readme.includes('node preflight/scripts/scan.js'), 'CLI usage points at scripts/scan.js');
   // The /scan command exists where the plugin loader looks for commands.
   assert.ok(fs.existsSync(path.join(ROOT, 'commands', 'scan.md')));
 });
 
-test('every one of the 59 checks appears in references/checklist.md and the README table', () => {
+test('every one of the 59 checks appears in references/checklist.md, and the README counts match the catalog', () => {
   assert.equal(CHECKS.length, 59);
   const checklist = fs.readFileSync(path.join(ROOT, 'skills', 'preflight', 'references', 'checklist.md'), 'utf8');
   const headings = [...checklist.matchAll(/^### ([A-Z]+-\d+): /gm)].map((m) => m[1]);
@@ -147,7 +153,27 @@ test('every one of the 59 checks appears in references/checklist.md and the READ
     const section = checklist.slice(checklist.indexOf(`### ${c.id}: `)).split('\n### ')[0];
     for (const label of ['**What:**', '**Why it matters:**', "**How it's detected:**", '**Fix:**']) assert.ok(section.includes(label), `${c.id} missing ${label}`);
   }
+  // The README links to the checklist instead of carrying a per-check table, and its
+  // numbers (the tagline and the per-group counts) come from the catalog.
   const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
-  const rows = [...readme.matchAll(/^\| ([A-Z]+-\d+) \| (.+?) \| .+? \| (critical|high|medium|low) \| (auto|auto \+ agent|manual) \|$/gm)].map((m) => m[1]);
-  assert.deepEqual(rows, CHECKS.map((c) => c.id));
+  assert.ok(readme.includes('](skills/preflight/references/checklist.md)'));
+  assert.ok(!/^\| [A-Z]+-\d+ \|/m.test(readme), 'no per-check table in the README');
+  assert.ok(readme.includes(`${CHECKS.length} checks`));
+  const counts = [...readme.matchAll(/^- \*\*[^*]+ \((\d+)\):\*\*/gm)].map((m) => Number(m[1]));
+  assert.deepEqual(counts, GROUPS.map((g) => CHECKS.filter((c) => c.group === g.key).length));
+});
+
+test('the README example finding is real scanner output', () => {
+  const { stdout } = scan(['./fixtures/vulnerable']);
+  const block = stdout.slice(stdout.indexOf('✖ FAIL    critical  SEC-03')).split('\n\n')[0];
+  assert.ok(block.startsWith('✖ FAIL'), 'SEC-03 is in the scan output');
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  assert.ok(readme.includes(`\`\`\`text\n${block}\n\`\`\``), 'README shows the SEC-03 block exactly as the scanner prints it');
+});
+
+test('the demo GIF exists, loops, and stays small enough for a README', () => {
+  const gif = fs.readFileSync(path.join(ROOT, 'assets', 'demo.gif'));
+  assert.equal(gif.subarray(0, 6).toString('latin1'), 'GIF89a');
+  assert.ok(gif.includes(Buffer.from('NETSCAPE2.0', 'latin1')), 'loops (NETSCAPE2.0 extension)');
+  assert.ok(gif.length < 8 * 1024 * 1024, `${(gif.length / 1048576).toFixed(1)} MB`);
 });
