@@ -8,7 +8,7 @@ A Claude Code plugin: install it, run `/scan` in your repo, and deterministic No
 
 The deterministic scan runs in seconds; Claude's full `/scan` review, adjudicating the unclear hits, takes a few minutes.
 
-![Installing the preflight plugin with the claude CLI, then running /scan in Claude Code on a deliberately vulnerable demo app](assets/demo.gif)
+![Running /scan in Claude Code on a deliberately vulnerable demo app, then listing the findings in the preflight-report.md it wrote](assets/demo.gif)
 
 ## Quick start
 
