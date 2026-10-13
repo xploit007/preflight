@@ -14,7 +14,7 @@ If another plugin also defines `/scan`, use `/preflight:scan`. With the skills.s
 
 What `/scan` does:
 
-1. Runs `node scripts/scan.js <repo> --json`: 59 checks, one result each, exit code 1 if any critical check fails.
+1. Runs `node scripts/scan.js <repo> --json`: 69 checks, one result each, exit code 1 if any critical check fails.
 2. For every `warn` and `manual` result, reads the code at the evidence lines and answers that result's precise question (confirmed, not an issue, or needs the owner). It doesn't re-scan the repo by eye.
 3. Writes `preflight-report.md` in the scanned repo: findings ordered by severity, each with `file:line` evidence and a concrete fix, plus a to-do list for dashboard-only items such as spend caps.
 

@@ -92,6 +92,13 @@ test('comment blanking keeps offsets and leaves strings alone', () => {
   assert.equal(blankComments('key: v # c\nx: "a # b"', '.yml'), 'key: v    \nx: "a # b"');
 });
 
+test('comment blanking leaves JSX closing and self-closing tags alone', () => {
+  for (const line of ['<a href="/x">A</a> <a href="/y">B</a>', '<input value={x} /> <a href="/terms">T</a>', '<Foo bar={1} /><a href="/terms">T</a>']) {
+    assert.equal(blankComments(line, '.jsx'), line);
+  }
+  assert.equal(blankComments('if (a < /re/.test(b)) x = 1;', '.js'), 'if (a < /  /.test(b)) x = 1;', 'real regex literals are still blanked');
+});
+
 test('splitArgs handles nested calls, strings and templates', () => {
   const text = "f(a(1, 2), 'x, y', `t ${g(3, 4)}`, { k: [1, 2] })";
   const { args } = splitArgs(text, 1);
@@ -407,4 +414,95 @@ test('webhook receivers and admin pages: stubs, delegation, manual HMAC, layouts
   const admin = results.get('AUTH-04');
   assert.equal(admin.status, 'pass', admin.evidence.join('\n'));
   assert.match(admin.evidence[0], /^1 admin/, 'components named Admin* are not pages');
+});
+
+test('new legal and auth checks: consent, mail, policy pages and URLs, API-only repos, MFA, OAuth-only sign-in, password rules, assets, kids', () => {
+  const run = (files) => byId(scan([tempDir(files), '--json', '--offline', '--no-history', '--only', 'legal,AUTH-2FA,AUTH-PW']).json);
+
+  // Consented tracking, transactional mail, hosted policy links, Clerk sign-in.
+  const a = run({
+    'package.json': JSON.stringify({ name: 'a', dependencies: { '@clerk/nextjs': '6.0.0', next: '15.0.0', resend: '6.0.0' } }),
+    'app/layout.tsx': [
+      "import { ClerkProvider } from '@clerk/nextjs';",
+      "import Script from 'next/script';",
+      'export default function RootLayout({ children }) {',
+      '  return (<html lang="en"><body>',
+      '    <Script src="https://consent.cookiebot.com/uc.js" data-cbid="x" />',
+      '    <Script src="https://www.googletagmanager.com/gtag/js?id=G-TEST12345" />',
+      '    <ClerkProvider>{children}</ClerkProvider>',
+      '    <footer><a href="https://app.termly.io/document/privacy-policy/abc">Privacy</a> <a href="/terms">Terms</a></footer>',
+      '  </body></html>);',
+      '}',
+      '',
+    ].join('\n'),
+    'app/api/reset/route.ts': "import { Resend } from 'resend';\nconst resend = new Resend(process.env.RESEND_API_KEY);\nexport async function POST(req) {\n  const { email } = await req.json();\n  await resend.emails.send({ from: 'a@b.co', to: email, subject: 'Reset your password', html: '<a href=\"#\">Reset</a>' });\n  return Response.json({ ok: true });\n}\n",
+  });
+  assert.equal(a.get('LEGAL-05').status, 'pass', a.get('LEGAL-05').evidence.join('\n'));
+  assert.match(a.get('LEGAL-05').evidence[0], /Cookiebot/i);
+  assert.equal(a.get('LEGAL-06').status, 'pass', a.get('LEGAL-06').evidence.join('\n'));
+  assert.equal(a.get('LEGAL-04').status, 'pass', a.get('LEGAL-04').evidence.join('\n'));
+  assert.equal(a.get('AUTH-2FA').status, 'manual');
+  assert.match(a.get('AUTH-2FA').question, /Clerk.*dashboard/);
+  assert.equal(a.get('AUTH-PW').status, 'pass');
+
+  // Marketing mail with List-Unsubscribe, zxcvbn signup, a self-hosted font, a stock photo, a birthdate field.
+  const b = run({
+    'package.json': JSON.stringify({ name: 'b', dependencies: { express: '4.0.0', resend: '6.0.0', zxcvbn: '4.4.2', bcrypt: '5.0.0' } }),
+    'server/mail.js': "const { Resend } = require('resend');\nconst resend = new Resend(process.env.RESEND_API_KEY);\nasync function sendNewsletter(subscribers) {\n  for (const s of subscribers) {\n    await resend.emails.send({\n      to: s.email,\n      subject: 'Our monthly newsletter',\n      headers: { 'List-Unsubscribe': '<https://x.co/unsub>', 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' },\n      html: '<p>News</p>',\n    });\n  }\n}\nmodule.exports = { sendNewsletter };\n",
+    'server/signup.js': "const express = require('express');\nconst bcrypt = require('bcrypt');\nconst zxcvbn = require('zxcvbn');\nconst router = express.Router();\nrouter.post('/signup', async (req, res) => {\n  const { email, password, birthdate } = req.body;\n  if (zxcvbn(password).score < 3) return res.status(400).end();\n  const hash = await bcrypt.hash(password, 12);\n  res.json({ ok: Boolean(hash), email, birthdate });\n});\nmodule.exports = router;\n",
+    'public/fonts/Brand-Regular.woff2': 'wOF2',
+    'public/img/shutterstock_123456789.jpg': 'jpeg',
+  });
+  assert.equal(b.get('LEGAL-06').status, 'pass', b.get('LEGAL-06').evidence.join('\n'));
+  assert.match(b.get('LEGAL-06').evidence[0], /1 marketing/);
+  assert.equal(b.get('AUTH-PW').status, 'pass', b.get('AUTH-PW').evidence.join('\n'));
+  assert.ok(b.get('AUTH-PW').evidence.some((e) => /zxcvbn/.test(e)) && b.get('AUTH-PW').evidence.some((e) => /no breached-password screening/.test(e)));
+  assert.equal(b.get('LEGAL-10').status, 'manual');
+  assert.ok(b.get('LEGAL-10').evidence.some((e) => e.startsWith('public/fonts/Brand-Regular.woff2')) && b.get('LEGAL-10').evidence.some((e) => /stock site/.test(e)));
+  assert.equal(b.get('LEGAL-09').status, 'manual');
+  assert.match(b.get('LEGAL-09').evidence.join('\n'), /birthdate/);
+  // An API with no pages of its own: its policies would live on the site in front of it.
+  assert.equal(b.get('LEGAL-04').status, 'manual', b.get('LEGAL-04').evidence.join('\n'));
+  assert.match(b.get('LEGAL-04').question, /API with no pages.*privacy policy and terms of service/);
+
+  // Passwords set only through Supabase from the browser: the policy lives in the dashboard.
+  const c = run({
+    'package.json': JSON.stringify({ name: 'c', dependencies: { '@supabase/supabase-js': '2.0.0', react: '19.0.0' } }),
+    'src/Signup.jsx': "import { supabase } from './supabase';\nexport default function Signup() {\n  async function submit(e) { e.preventDefault(); await supabase.auth.signUp({ email: e.target.email.value, password: e.target.password.value }); }\n  return <form onSubmit={submit}><label htmlFor=\"e\">Email</label><input id=\"e\" name=\"email\" type=\"email\" /><label htmlFor=\"p\">Password</label><input id=\"p\" name=\"password\" type=\"password\" /><button>Sign up</button></form>;\n}\n",
+  });
+  assert.equal(c.get('AUTH-PW').status, 'manual');
+  assert.match(c.get('AUTH-PW').question, /Supabase/);
+  assert.equal(c.get('AUTH-2FA').status, 'warn');
+  assert.equal(c.get('LEGAL-04').status, 'fail', 'a signup page with no privacy policy or terms');
+
+  // A static page with no accounts, payments or tracking: nothing applies.
+  const d = run({ 'index.html': '<!doctype html><html lang="en"><body><h1>Hello</h1></body></html>' });
+  for (const id of ['AUTH-2FA', 'AUTH-PW', 'LEGAL-04', 'LEGAL-06', 'LEGAL-08', 'LEGAL-09']) assert.match(d.get(id).evidence[0], /^Not applicable/, id);
+
+  // GitHub-only sign-in, policy URLs in constants, a children prop and a "birthday" keyword, AI SDK packages.
+  const e = run({
+    'package.json': JSON.stringify({ name: 'e', dependencies: { next: '15.0.0', 'next-auth': '5.0.0', resend: '6.0.0', '@ai-sdk/openai': '2.0.0', '@ai-sdk/otel': '1.0.0' } }),
+    'auth.ts': "import NextAuth from 'next-auth';\nimport GitHub from 'next-auth/providers/github';\nexport const { handlers, auth } = NextAuth({ providers: [GitHub] });\n",
+    'lib/constants.ts': "export const PRIVACY_URL = process.env.NEXT_PUBLIC_PRIVACY_URL || 'https://example.com/privacy';\nexport const TERMS_URL = process.env.NEXT_PUBLIC_TERMS_URL || 'https://example.com/terms';\n",
+    'lib/holidays.ts': "export const EMOJI = [{ keywords: ['birthday', 'anniversary'], emoji: 'cake' }];\n",
+    'components/Shimmer.tsx': "import { useMemo } from 'react';\nexport function Shimmer({ children }) {\n  const n = useMemo(() => (children?.length ?? 0) * 2, [children]);\n  return <p style={{ width: n }}>{children}</p>;\n}\n",
+    'app/api/link/route.ts': "import { Resend } from 'resend';\nconst resend = new Resend(process.env.RESEND_API_KEY);\nexport async function POST(req) {\n  const { email } = await req.json();\n  await resend.emails.send({ from: 'a@b.co', to: email, subject: 'Your sign-in link', html: '<a href=\"#\">Sign in</a>' });\n  return Response.json({ ok: true });\n}\n",
+  });
+  assert.equal(e.get('AUTH-2FA').status, 'pass', e.get('AUTH-2FA').evidence.join('\n'));
+  assert.match(e.get('AUTH-2FA').evidence.join('\n'), /No password sign-in found/);
+  assert.equal(e.get('LEGAL-04').status, 'pass', e.get('LEGAL-04').evidence.join('\n'));
+  assert.equal(e.get('LEGAL-09').status, 'pass', e.get('LEGAL-09').evidence.join('\n'));
+  assert.match(e.get('LEGAL-06').evidence[0], /all transactional/);
+  assert.ok(e.get('LEGAL-11').evidence.some((x) => x.includes('@ai-sdk/openai')) && !e.get('LEGAL-11').evidence.some((x) => x.includes('@ai-sdk/otel')));
+
+  // Password sign-in where the only second-factor-like code is an "otp", and a character-class password rule.
+  const f = run({
+    'package.json': JSON.stringify({ name: 'f', dependencies: { express: '4.0.0', bcrypt: '5.0.0' } }),
+    'server/validate.js': "const password = (value) => {\n  if (!value.match(/\\d/) || !value.match(/[a-zA-Z]/)) throw new Error('needs a letter and a number');\n  return value;\n};\nmodule.exports = { password };\n",
+    'server/auth.js': "const express = require('express');\nconst bcrypt = require('bcrypt');\nconst router = express.Router();\nrouter.post('/login', async (req, res) => {\n  const { email, password, otp } = req.body;\n  res.json({ ok: await bcrypt.compare(password, email + otp) });\n});\nrouter.post('/signup', async (req, res) => {\n  const hash = await bcrypt.hash(req.body.password, 12);\n  res.json({ ok: Boolean(hash) });\n});\nmodule.exports = router;\n",
+  });
+  assert.equal(f.get('AUTH-2FA').status, 'warn');
+  assert.match(f.get('AUTH-2FA').question, /one-time code \("otp"\)/);
+  assert.equal(f.get('AUTH-PW').status, 'pass', f.get('AUTH-PW').evidence.join('\n'));
+  assert.match(f.get('AUTH-PW').evidence[0], /^server\/validate\.js:2 — password complexity rule/);
 });

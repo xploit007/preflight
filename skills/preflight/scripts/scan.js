@@ -44,6 +44,7 @@ const GROUPS = [
   require('./checks/appsec'),
   require('./checks/infra'),
   require('./checks/comms'),
+  require('./checks/legal'),
   require('./checks/a11y'),
   require('./checks/ai'),
 ];
@@ -1067,7 +1068,7 @@ const { pass, fail, warn, manual, na, ev } = require('../lib/result');
 const { splitArgs, literalValue } = require('../lib/util');
 const { collectColumns } = require('./data');
 
-const IDS = ['AUTH-01', 'AUTH-02', 'AUTH-03', 'AUTH-04', 'AUTH-05', 'AUTH-06', 'AUTH-07', 'AUTH-08', 'AUTH-09', 'AUTH-10'];
+const IDS = ['AUTH-01', 'AUTH-02', 'AUTH-03', 'AUTH-04', 'AUTH-05', 'AUTH-06', 'AUTH-07', 'AUTH-08', 'AUTH-09', 'AUTH-10', 'AUTH-2FA', 'AUTH-PW'];
 
 // Routes that are public by design (auth flows, webhooks with signatures, health checks, public forms).
 const PUBLIC_PATH_RE = /(?:^|\/)(?:login|log-in|logout|signin|sign-in|signup|sign-up|register|join|auth|oauth|callback|forgot[\w-]*|reset[\w-]*|verify[\w-]*|confirm[\w-]*|magic[\w-]*|otp|webhooks?|[\w-]*webhook[\w-]*|health|healthz|status|ping|ready|version|robots\.txt|sitemap[\w.]*|og|contact|subscribe|newsletter|waitlist|unsubscribe|csp-report|cron)(?:\/|$|\.)/i;
@@ -1087,7 +1088,7 @@ async function run(root, opts = {}) {
   const { routes, nextMiddleware } = getRoutes(repo);
   const server = repo.sources({ kinds: ['code'], tests: false, js: true }).filter((f) => repo.side(f) !== 'client' && !repo.isTooling(f));
   const ctx = { repo, routes, nextMiddleware, server, opts };
-  return [weakAuth(ctx), missingAuthz(ctx), crossUser(ctx), adminRoutes(ctx), passwordReset(ctx), sessions(ctx), idor(ctx), massAssignment(ctx), oauth(ctx), await cookies(ctx)];
+  return [weakAuth(ctx), missingAuthz(ctx), crossUser(ctx), adminRoutes(ctx), passwordReset(ctx), sessions(ctx), idor(ctx), massAssignment(ctx), oauth(ctx), await cookies(ctx), twoFactor(ctx), passwordPolicy(ctx)];
 }
 
 const chain = (r) => `${r.mountMiddleware || ''}\n${routeBody(r)}`;
@@ -1160,6 +1161,268 @@ function missingAuthz(ctx) {
   }
   if (open.length) return warn('AUTH-02', open);
   return pass('AUTH-02', [`Checked ${considered} state-changing or user-data route(s): each has an auth check in its handler, middleware chain or mount.`]);
+}
+
+
+// ── Sign-in implementation (shared with legal.js) ────────────────────────────
+
+// Hosted sign-in: MFA and password rules are dashboard settings, not code.
+const HOSTED_AUTH = [
+  { name: 'Clerk', re: /['"]@clerk\/[\w-]+['"]|\bclerkMiddleware\s*\(/ },
+  { name: 'Auth0', re: /['"]@auth0\/[\w-]+['"]/ },
+  { name: 'Kinde', re: /['"]@kinde-oss\/[\w-]+['"]/ },
+  { name: 'WorkOS', re: /['"]@workos-inc\/[\w-]+['"]/ },
+  { name: 'Stack Auth', re: /['"]@stackframe\/[\w-]+['"]/ },
+  { name: 'Descope', re: /['"]@descope\/[\w-]+['"]/ },
+  { name: 'Stytch', re: /['"]@stytch\/[\w-]+['"]/ },
+  { name: 'Amazon Cognito', re: /['"](?:aws-amplify|@aws-amplify\/[\w-]+|amazon-cognito-identity-js)['"]/ },
+];
+// Auth libraries and managed backends whose sign-in flows live in the app's own code.
+const LIBRARY_AUTH = [
+  { name: 'Supabase Auth', re: /\bsupabase\.auth\.\w+|\.auth\.(?:getUser|getSession|signInWithPassword|signInWithOtp|signInWithOAuth|signUp)\s*\(/ },
+  { name: 'Auth.js (NextAuth)', re: /['"](?:next-auth|next-auth\/[\w-]+|@auth\/[\w-]+)['"]|\bNextAuth\s*\(/ },
+  { name: 'Firebase Auth', re: /['"](?:firebase\/auth|firebase-admin\/auth)['"]/ },
+  { name: 'better-auth', re: /['"]better-auth(?:\/[\w-]+)?['"]/ },
+  { name: 'Lucia', re: /['"]lucia['"]|\bnew\s+Lucia\s*\(/ },
+  { name: 'SuperTokens', re: /['"]supertokens-[\w-]+['"]/ },
+  { name: 'Passport', re: /['"]passport['"]|\bpassport\.authenticate\s*\(/ },
+];
+const LOGIN_PATH_RE = /(?:^|\/)(?:login|log-in|signin|sign-in|sessions?|authenticate)(?:\/|$)|^action:(?:log_?in|sign_?in|authenticate)/i;
+const SIGNUP_PATH_RE = /(?:^|\/)(?:signup|sign-up|register|registration)(?:\/|$)|^action:(?:sign_?up|register)/i;
+
+const implCache = new WeakMap();
+
+/**
+ * How users sign in: { provider, hosted, f, line, label, evidence } for the first hosted provider,
+ * auth library or custom login/signup route found, or null when the app has no user accounts.
+ */
+function authImplementation(repo, routes) {
+  if (implCache.has(repo)) return implCache.get(repo);
+  const files = repo.sources({ kinds: ['code'], tests: false }).filter((f) => !repo.isTooling(f));
+  const firstHit = (re) => {
+    for (const f of files) {
+      const text = repo.code(f) || '';
+      const m = re.exec(text);
+      if (m) return { f, line: repo.lineOf(f, m.index) };
+    }
+    return null;
+  };
+  let impl = null;
+  for (const [list, hosted] of [[HOSTED_AUTH, true], [LIBRARY_AUTH, false]]) {
+    for (const p of list) {
+      const hit = firstHit(p.re);
+      if (!hit) continue;
+      impl = { provider: p.name, hosted, f: hit.f, line: hit.line, label: p.name, evidence: [ev(hit.f.rel, hit.line, `${p.name} sign-in`, repo.snippet(hit.f, hit.line))] };
+      break;
+    }
+    if (impl) break;
+  }
+  if (!impl) {
+    const route = routes.find((r) => isWrite(r) && LOGIN_PATH_RE.test(r.path)) || routes.find((r) => isWrite(r) && SIGNUP_PATH_RE.test(r.path));
+    if (route) impl = { provider: 'custom', hosted: false, f: route.file, line: route.line, label: routeLabel(route), evidence: [ev(route.file.rel, route.line, `${routeLabel(route)} signs users in with a password and no second factor`, repo.snippet(route.file, route.line))] };
+  }
+  implCache.set(repo, impl);
+  return impl;
+}
+
+// ── AUTH-2FA ───────────────────────────────────────────────────────────────
+
+// Strong signals name a second factor outright. Weak ones (one-time codes) are just as common in
+// passwordless sign-in and email verification, so on their own they raise a question, not a pass.
+const STRONG_2FA_TERMS = /otplib|speakeasy|otpauth|simplewebauthn|totp|2fa|mfa|two[-_ ]?factor|multi[-_ ]?factor|webauthn|passkeys?/gi;
+const STRONG_2FA_CALL_RE = /\bauthenticator\.(?:check|verify|keyuri|generateSecret)\s*\(|\bauthenticator app\b|navigator\.credentials\.(?:create|get)\s*\(/i;
+const WEAK_2FA_TERMS = /hotp|otp|one[-_ ]?time[-_ ]?(?:code|password|passcode|pin)/gi;
+const STRONG_2FA_DEP_RE = /^(?:otplib|@otplib\/[\w-]+|speakeasy|@levminer\/speakeasy|otpauth|node-2fa|2fa-util|totp-generator)$|totp|webauthn|passkey/i;
+// Password sign-in, as opposed to OAuth and email links, where the identity provider holds the second factor.
+const PASSWORD_SIGNIN_RE = /\bsignInWithPassword\s*\(|\bsignInWithEmailAndPassword\s*\(|\bCredentials(?:Provider)?\s*\(\s*\{|['"](?:next-auth|@auth\/core)\/providers\/credentials['"]|\bemailAndPassword\s*:\s*\{[^}]{0,80}\benabled\s*:\s*true|['"]passport-local['"]|\bnew\s+LocalStrategy\s*\(|\b(?:bcrypt|bcryptjs)\.compare(?:Sync)?\s*\(|\bargon2\.verify\s*\(|\b(?:verifyPassword|comparePassword|checkPassword|isPasswordMatch|validatePassword)\s*\(|\bverify\s*\(\s*[\w.$]*(?:password|hash)[\w.$]*\s*,|<input\b[^>]*?\b(?:name|id)\s*=\s*\{?\s*["'`]password["'`]|\bautoComplete\s*=\s*\{?\s*["'`]current-password["'`]/i;
+
+/**
+ * First match of `re` (global, case-insensitive) that is a whole word or a whole camelCase part,
+ * so "mfa" counts in mfaEnabled and verifyMfa but not in a longer word.
+ */
+function termMatch(text, re) {
+  const g = new RegExp(re.source, re.flags);
+  let m;
+  while ((m = g.exec(text))) {
+    const before = text[m.index - 1] || ' ';
+    const after = text[m.index + m[0].length] || ' ';
+    const starts = !/[A-Za-z0-9]/.test(before) || (/[a-z0-9]/.test(before) && /[A-Z]/.test(m[0][0]));
+    if (starts && !/[a-z]/.test(after)) return m;
+    g.lastIndex = m.index + 1; // retry one character on: "signInWithOtp" first matches "hOtp"
+  }
+  return null;
+}
+
+const passwordSignInCache = new WeakMap();
+
+/** Where users sign in with a password, as evidence lines; empty when sign-in is OAuth or email links only. */
+function passwordSignIn(ctx) {
+  const { repo, routes } = ctx;
+  if (passwordSignInCache.has(repo)) return passwordSignInCache.get(repo);
+  const out = [];
+  for (const r of routes) {
+    if (!isWrite(r) || !LOGIN_PATH_RE.test(r.path)) continue;
+    const body = segments(r, { helpers: false }).map((x) => x.text).join('\n');
+    if (/password/i.test(body)) out.push(ev(r.file.rel, r.line, `${routeLabel(r)} signs users in with a password`, repo.snippet(r.file, r.line)));
+  }
+  for (const f of repo.sources({ kinds: ['code', 'markup'], tests: false }).filter((x) => !repo.isTooling(x))) {
+    const m = PASSWORD_SIGNIN_RE.exec(repo.code(f) || '');
+    if (!m) continue;
+    const line = repo.lineOf(f, m.index);
+    if (!repo.suppressed(f, line)) out.push(ev(f.rel, line, 'password sign-in', repo.snippet(f, line)));
+  }
+  for (const l of passwordSetLocations(ctx)) out.push(ev(l.f.rel, l.line, l.label, repo.snippet(l.f, l.line)));
+  const unique = [...new Map(out.map((e) => [e.split(' — ')[0], e])).values()]; // one line per file:line
+  passwordSignInCache.set(repo, unique);
+  return unique;
+}
+
+function twoFactor(ctx) {
+  const { repo, routes } = ctx;
+  const impl = authImplementation(repo, routes);
+  if (!impl) return na('AUTH-2FA', 'no user accounts or sign-in code found');
+  const who = impl.provider === 'custom' ? 'the custom sign-in' : impl.provider;
+  let weak = null;
+  for (const f of repo.sources({ kinds: ['code', 'markup'], tests: false })) {
+    const text = repo.code(f) || '';
+    const m = termMatch(text, STRONG_2FA_TERMS) || STRONG_2FA_CALL_RE.exec(text);
+    if (m) {
+      const line = repo.lineOf(f, m.index);
+      return pass('AUTH-2FA', [ev(f.rel, line, `2FA code path ("${m[0]}") for ${who}`, repo.snippet(f, line))]);
+    }
+    const w = !weak && termMatch(text, WEAK_2FA_TERMS);
+    if (w) weak = { f, line: repo.lineOf(f, w.index), term: w[0] };
+  }
+  const dep = [...repo.deps].find((d) => STRONG_2FA_DEP_RE.test(d));
+  if (dep) return pass('AUTH-2FA', [`2FA dependency installed: ${dep}`]);
+  if (impl.hosted) {
+    return manual('AUTH-2FA', impl.evidence, { question: `Sign-in runs on ${impl.provider}, which turns MFA on in its dashboard rather than in code. Is MFA enabled, and required for admins?` });
+  }
+  const password = passwordSignIn(ctx).slice(0, 3);
+  if (!password.length) {
+    return pass('AUTH-2FA', [...impl.evidence, `No password sign-in found: users sign in through ${who} with OAuth or email links only, so the identity provider (Google, GitHub, the user's inbox) holds the second factor.`]);
+  }
+  if (weak) {
+    return warn('AUTH-2FA', [...password, ev(weak.f.rel, weak.line, `one-time code ("${weak.term}"), but no TOTP, passkey or MFA code`, repo.snippet(weak.f, weak.line))], {
+      question: `Users sign in with a password, and the only second-factor-like code is a one-time code ("${weak.term}"). Is it a second factor checked after the password, or a sign-in or verification code that stands alone?`,
+    });
+  }
+  return warn('AUTH-2FA', [...password, 'No TOTP, passkey/WebAuthn or MFA enrollment or verification code found.']);
+}
+
+// ── AUTH-PW ────────────────────────────────────────────────────────────────
+
+const PASSWORD_SET_PATH_RE = /(?:^|\/)(?:signup|sign-up|register|registration|join|reset[-_]?password|password[-_]?reset|change[-_]?password|set[-_]?password|update[-_]?password|password)(?:\/|$)|^action:(?:sign_?up|register|reset_?password|change_?password|update_?password|set_?password)$/i;
+// Provider SDK calls that set a password; the provider's dashboard holds the policy.
+const MANAGED_PASSWORD_CALLS = [
+  { provider: 'Supabase Auth', re: /\.auth\.signUp\s*\(\s*\{[^}]{0,300}\bpassword\b|\.auth\.updateUser\s*\(\s*\{[^}]{0,300}\bpassword\b/g },
+  { provider: 'Firebase Auth', re: /\b(?:createUserWithEmailAndPassword|updatePassword|confirmPasswordReset)\s*\(/g },
+  { provider: 'Clerk', re: /\bsignUp\.create\s*\(\s*\{[^}]{0,300}\bpassword\b/g },
+  { provider: 'Auth0', re: /\bdbConnections\.signup\s*\(/g },
+];
+const PASSWORD_HASH_RE = /\b(?:bcrypt|bcryptjs)\.hash(?:Sync)?\s*\(|\bargon2\.hash\s*\(|\bscrypt(?:Sync)?\s*\(/g;
+const STRENGTH_RE = /\bzxcvbn\b|@zxcvbn-ts|password-validator|check-password-strength|owasp-password-strength-test|\bisStrongPassword\s*\(|\bpasswordStrength\s*\(/;
+const MIN_LENGTH_RE = /password[\w$"'\]]*[^;\n]{0,120}?(?:\.min(?:Length)?\(\s*|minLength\s*[:=]\s*\{?\s*|minlength\s*=\s*\{?["']?|\.length\s*<=?\s*)(\d{1,3})(?!\d)|minPasswordLength\s*:\s*(\d{1,3})/gi;
+// Character-class rules: (?=.*[A-Z]) lookaheads, and /[A-Z]/, /\d/ or /[^A-Za-z0-9]/ matched against
+// the password. They sit inside regex literals, which comment blanking empties, so this runs on raw text.
+const CHAR_CLASS = String.raw`(?:\[\^?(?=[^\]\n]{0,40}?(?:A-Z|a-z|0-9|\\d|[!@#$%&*]))[^\]\n]{1,40}\]|\\d|\\p\{L[ul]\})`;
+const COMPLEXITY_RE = new RegExp(String.raw`\(\?=\.\*\??${CHAR_CLASS}|\.(?:match|search|regex|matches)\(\s*\/${CHAR_CLASS}[+*]?\/[a-z]*\s*[,)]|\/${CHAR_CLASS}[+*]?\/[a-z]*\.test\(`, 'g');
+const BREACH_RE = /api\.pwnedpasswords\.com|haveibeenpwned|pwnedpasswords|['"]hibp['"]|\bhaveIBeenPwned\s*\(|\bisPwned\s*\(|\bpwnedPassword\s*\(|breached[-_]?passwords?|leaked[-_]?password/i;
+const AUTH_PATH_RE = /(?:^|[/._-])(?:auth|password|passwords|signup|sign-up|register|registration|accounts?|users?|validations?|validators?|identity|credentials)(?:[/._-]|$)|password/i;
+const MAX_LENGTH_RE = /password[\w$"'\]]*[^;\n]{0,120}?(?:\.max(?:Length)?\(\s*|maxLength\s*[:=]\s*\{?\s*|maxlength\s*=\s*\{?["']?|\.length\s*>=?\s*)(\d{1,3})(?!\d)/gi;
+
+const passwordSetCache = new WeakMap();
+
+/** Where passwords get set: { file, line, label, provider } (provider null = the app's own code). */
+function passwordSetLocations({ repo, routes }) {
+  if (passwordSetCache.has(repo)) return passwordSetCache.get(repo);
+  const out = [];
+  passwordSetCache.set(repo, out);
+  const seen = new Set();
+  const add = (f, line, label, provider) => {
+    const key = `${f.rel}:${line}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ f, line, label, provider });
+  };
+  for (const r of routes) {
+    if (!isWrite(r) || !PASSWORD_SET_PATH_RE.test(r.path)) continue;
+    const body = segments(r, { helpers: false }).map((x) => x.text).join('\n');
+    if (!/password/i.test(body)) continue;
+    const managed = MANAGED_PASSWORD_CALLS.find((c) => new RegExp(c.re.source).test(body));
+    add(r.file, r.line, `${routeLabel(r)} sets a password`, managed ? managed.provider : null);
+  }
+  for (const f of repo.sources({ kinds: ['code'], tests: false }).filter((x) => !repo.isTooling(x))) {
+    const text = repo.code(f) || '';
+    for (const c of MANAGED_PASSWORD_CALLS) {
+      for (const m of text.matchAll(c.re)) add(f, repo.lineOf(f, m.index), `${c.provider} sets a password`, c.provider);
+    }
+    if (repo.side(f) === 'client') continue;
+    for (const m of text.matchAll(PASSWORD_HASH_RE)) {
+      if (!/password/i.test(text.slice(m.index, m.index + 120))) continue;
+      add(f, repo.lineOf(f, m.index), 'password is hashed and stored here', null);
+    }
+  }
+  return out;
+}
+
+function passwordPolicy(ctx) {
+  const { repo } = ctx;
+  const locations = passwordSetLocations(ctx);
+  if (!locations.length) return na('AUTH-PW', 'no signup, password-change or reset code that sets passwords found');
+  let strength = null;
+  let breach = null;
+  const caps = [];
+  // Look near the auth flow first, so a user password rule wins over, say, a Zoom meeting password generator.
+  const setters = new Set(locations.map((l) => l.f.rel));
+  const rank = (f) => (setters.has(f.rel) ? 0 : AUTH_PATH_RE.test(f.rel) ? 1 : 2);
+  for (const f of repo.sources({ kinds: ['code', 'markup'], tests: false }).sort((a, b) => rank(a) - rank(b))) {
+    const text = repo.code(f) || '';
+    const at = (index) => repo.lineOf(f, index);
+    if (!strength) {
+      const lib = STRENGTH_RE.exec(text);
+      if (lib) strength = ev(f.rel, at(lib.index), `password strength check (${lib[0].replace(/\s*\($/, '')})`);
+    }
+    if (!strength) {
+      for (const m of text.matchAll(MIN_LENGTH_RE)) {
+        if (Number(m[1] || m[2]) >= 12) {
+          strength = ev(f.rel, at(m.index), `passwords need at least ${m[1] || m[2]} characters`);
+          break;
+        }
+      }
+    }
+    if (!strength && /password/i.test(text)) {
+      const raw = repo.read(f) || '';
+      for (const m of raw.matchAll(COMPLEXITY_RE)) {
+        // Skip commented-out rules (blanked in code()), and rules nowhere near a password.
+        if (text[m.index] !== raw[m.index] || !/password/i.test(raw.slice(Math.max(0, m.index - 300), m.index + 300))) continue;
+        strength = ev(f.rel, at(m.index), 'password complexity rule', repo.snippet(f, at(m.index)));
+        break;
+      }
+    }
+    if (!breach) {
+      const b = BREACH_RE.exec(text);
+      if (b) breach = ev(f.rel, at(b.index), `breached-password screening (${b[0]})`);
+    }
+    for (const m of text.matchAll(MAX_LENGTH_RE)) {
+      const n = Number(m[1]);
+      if (n >= 32) continue;
+      const line = at(m.index);
+      if (!repo.suppressed(f, line)) caps.push(ev(f.rel, line, `passwords are capped at ${n} characters (a cap under 32 breaks passphrases and password managers)`, repo.snippet(f, line)));
+    }
+  }
+  const where = locations.map((l) => ev(l.f.rel, l.line, l.label, repo.snippet(l.f, l.line)));
+  if (strength || breach) {
+    const missing = !strength ? 'Note: no strength check (zxcvbn or a minimum of 12 or more characters).' : !breach ? 'Note: no breached-password screening (Have I Been Pwned).' : null;
+    return pass('AUTH-PW', [strength, breach, missing, ...caps].filter(Boolean));
+  }
+  const own = locations.filter((l) => !l.provider);
+  if (!own.length) {
+    const providers = [...new Set(locations.map((l) => l.provider))].join(', ');
+    const hint = providers.includes('Supabase') ? ' (Supabase: Auth settings, minimum password length and leaked password protection)' : '';
+    return manual('AUTH-PW', [...where, ...caps], { question: `Passwords are set through ${providers}, which keeps password rules in its dashboard. Does it require 12 or more characters and block breached passwords${hint}?` });
+  }
+  return warn('AUTH-PW', [...own.map((l) => ev(l.f.rel, l.line, `${l.label} with no strength check and no breached-password screening`, repo.snippet(l.f, l.line))), ...caps]);
 }
 
 // ── AUTH-03 ────────────────────────────────────────────────────────────────
@@ -1608,7 +1871,7 @@ async function cookies(ctx) {
   return pass('AUTH-10', ['Auth/session cookies are set with HttpOnly, Secure and SameSite.']);
 }
 
-module.exports = { name: 'auth', ids: IDS, run, PUBLIC_PATH_RE, isPublicPath, isProtected };
+module.exports = { name: 'auth', ids: IDS, run, PUBLIC_PATH_RE, isPublicPath, isProtected, authImplementation };
 },
 // ── checks/comms.js ───────────────────────────────────────────────────────
 "checks/comms.js": function (module, exports, require) {
@@ -3577,6 +3840,478 @@ function openRedirect({ repo, server, all, tainted }) {
 
 module.exports = { name: 'injection', ids: IDS, run };
 },
+// ── checks/legal.js ───────────────────────────────────────────────────────
+"checks/legal.js": function (module, exports, require) {
+'use strict';
+
+/**
+ * Legal pages, consent and data rights: LEGAL-04 privacy/terms/refund pages, LEGAL-05 trackers
+ * without cookie consent, LEGAL-06 marketing email without unsubscribe, and the manual reviews
+ * LEGAL-07 dark patterns, LEGAL-08 data deletion, LEGAL-09 children's data, LEGAL-10 font and
+ * image licenses, LEGAL-11 third-party SDK data sharing. Static only: no network, nothing run.
+ */
+
+const { loadRepo } = require('../lib/repo');
+const { getRoutes, resolveModule } = require('../lib/routes');
+const { authImplementation } = require('./auth');
+const { tagAt } = require('./a11y');
+const { pass, fail, warn, manual, na, ev } = require('../lib/result');
+
+const IDS = ['LEGAL-04', 'LEGAL-05', 'LEGAL-06', 'LEGAL-07', 'LEGAL-08', 'LEGAL-09', 'LEGAL-10', 'LEGAL-11'];
+
+async function run(root, opts = {}) {
+  const repo = loadRepo(root, opts);
+  const { routes } = getRoutes(repo);
+  const files = repo.sources({ kinds: ['code', 'markup'], tests: false });
+  const ctx = { repo, routes, files, app: files.filter((f) => !repo.isTooling(f)) };
+  ctx.trackers = findTrackers(ctx);
+  ctx.data = dataCollection(ctx);
+  return [legalPages(ctx), cookieConsent(ctx), unsubscribe(ctx), darkPatterns(ctx), dataDeletion(ctx), childrensData(ctx), assetLicenses(ctx), sdkAudit(ctx)];
+}
+
+/** First match of `re` in each file, as { f, line, m }. */
+function* hits(repo, files, re, { all = false } = {}) {
+  for (const f of files) {
+    const text = repo.code(f) || '';
+    const g = new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`);
+    for (const m of text.matchAll(g)) {
+      const line = repo.lineOf(f, m.index);
+      if (repo.suppressed(f, line)) continue;
+      yield { f, line, m, index: m.index, text };
+      if (!all) break;
+    }
+  }
+}
+
+// ── Shared: trackers and data collection ─────────────────────────────────────
+
+// Browser trackers that set cookies or identifiers. Cookieless analytics (Plausible, Fathom,
+// Simple Analytics, Umami, Vercel Analytics, Cloudflare Web Analytics) are deliberately absent.
+const TRACKERS = [
+  { name: 'Google Analytics / Tag Manager', cat: 'analytics', re: /googletagmanager\.com\/(?:gtag\/js|gtm\.js|ns\.html)|google-analytics\.com\/(?:analytics|ga)\.js|\bgtag\(\s*['"]config['"]|\bga\(\s*['"]create['"]|['"](?:react-ga4?|react-gtm-module|vue-gtag|ngx-google-analytics)['"]|import\s*\{[^}]*\bGoogle(?:Analytics|TagManager)\b[^}]*\}\s*from\s*['"]@next\/third-parties\/google['"]/ },
+  { name: 'Meta Pixel', cat: 'ads', re: /connect\.facebook\.net\/[\w-]+\/fbevents\.js|\bfbq\(\s*['"](?:init|track|trackCustom)['"]|['"]react-facebook-pixel['"]/ },
+  { name: 'Hotjar', cat: 'session replay', re: /static\.hotjar\.com|['"]@hotjar\/browser['"]|\b_hjSettings\b/ },
+  { name: 'Segment', cat: 'analytics', re: /cdn\.segment\.com|['"]@segment\/analytics-next['"]/ },
+  { name: 'Mixpanel', cat: 'analytics', re: /['"]mixpanel-browser['"]|cdn\.mxpnl\.com/ },
+  { name: 'Amplitude', cat: 'analytics', re: /['"](?:@amplitude\/analytics-browser|amplitude-js)['"]|cdn\.amplitude\.com/ },
+  { name: 'PostHog', cat: 'analytics', re: /['"]posthog-js['"]|\bposthog\.init\s*\(/, cookieless: /\bpersistence\s*:\s*['"]memory['"]|\bdisable_persistence\s*:\s*true|\bcookieless_mode\s*:/ },
+  { name: 'Heap', cat: 'analytics', re: /cdn\.heapanalytics\.com|\bheap\.load\s*\(/ },
+  { name: 'FullStory', cat: 'session replay', re: /['"]@fullstory\/browser['"]|edge\.fullstory\.com|fullstory\.com\/s\/fs\.js/ },
+  { name: 'LogRocket', cat: 'session replay', re: /['"]logrocket['"]|\bLogRocket\.init\s*\(/ },
+  { name: 'TikTok Pixel', cat: 'ads', re: /analytics\.tiktok\.com|\bttq\.(?:load|page|track)\s*\(/ },
+  { name: 'LinkedIn Insight Tag', cat: 'ads', re: /snap\.licdn\.com|\b_linkedin_partner_id\b/ },
+  { name: 'Microsoft Clarity', cat: 'session replay', re: /www\.clarity\.ms\/tag|['"]@microsoft\/clarity['"]/ },
+  { name: 'X (Twitter) Pixel', cat: 'ads', re: /static\.ads-twitter\.com\/uwt\.js|\btwq\(\s*['"]/ },
+  { name: 'Pinterest Tag', cat: 'ads', re: /s\.pinimg\.com\/ct\/core\.js|\bpintrk\(\s*['"]/ },
+  { name: 'Reddit Pixel', cat: 'ads', re: /redditstatic\.com\/ads\/pixel\.js|\brdt\(\s*['"]init['"]/ },
+  { name: 'Snap Pixel', cat: 'ads', re: /sc-static\.net\/scevent\.min\.js|\bsnaptr\(\s*['"]/ },
+];
+
+const trackerCache = new WeakMap();
+
+/** Every tracker that loads in the app: { name, cat, f, line }, one per tracker per file. */
+function findTrackers({ repo, app }) {
+  if (trackerCache.has(repo)) return trackerCache.get(repo);
+  const out = [];
+  for (const t of TRACKERS) {
+    for (const h of hits(repo, app, t.re)) {
+      if (t.cookieless && t.cookieless.test(h.text)) continue;
+      out.push({ name: t.name, cat: t.cat, f: h.f, line: h.line });
+    }
+  }
+  trackerCache.set(repo, out);
+  return out;
+}
+
+const PAYMENTS = [
+  { name: 'Stripe', re: /['"](?:stripe|@stripe\/stripe-js|@stripe\/react-stripe-js)['"]|js\.stripe\.com|\bcheckout\.sessions\.create\s*\(|\bpaymentIntents\.create\s*\(/ },
+  { name: 'Paddle', re: /['"]@paddle\/[\w-]+['"]|cdn\.paddle\.com/ },
+  { name: 'Lemon Squeezy', re: /['"]@lemonsqueezy\/[\w.-]+['"]|app\.lemonsqueezy\.com/ },
+  { name: 'PayPal', re: /['"]@paypal\/[\w-]+['"]|paypal\.com\/sdk\/js/ },
+  { name: 'Razorpay', re: /['"]razorpay['"]|checkout\.razorpay\.com/ },
+  { name: 'Braintree', re: /['"]braintree(?:-web)?['"]/ },
+];
+const PERSONAL_INPUT_RE = /<input\b[^>]*\b(?:type|name)\s*=\s*\{?\s*["'`](?:email|password|tel|phone)["'`]/i;
+
+/** What personal data the app takes in: { accounts, inputs, payments, tracking } evidence lines. */
+function dataCollection(ctx) {
+  const { repo, routes, app } = ctx;
+  const impl = authImplementation(repo, routes);
+  const accounts = impl ? [ev(impl.f.rel, impl.line, `user accounts (${impl.label})`)] : [];
+  const inputs = [...hits(repo, app, PERSONAL_INPUT_RE)].slice(0, 2).map((h) => ev(h.f.rel, h.line, 'form collects email, phone or password'));
+  const payments = [];
+  for (const p of PAYMENTS) {
+    const h = hits(repo, app, p.re).next().value;
+    if (h) payments.push(ev(h.f.rel, h.line, `payments (${p.name})`));
+  }
+  const tracking = ctx.trackers.slice(0, 2).map((t) => ev(t.f.rel, t.line, `${t.name} tracking`));
+  return { accounts, inputs, payments, tracking, personal: accounts.length + inputs.length + tracking.length > 0 };
+}
+
+// ── LEGAL-04 ───────────────────────────────────────────────────────────────
+
+const LEGAL_PAGES = {
+  privacy: { label: 'privacy policy', re: /^(?:privacy(?:[-_]?policy|[-_]?notice)?|datenschutz|data[-_]?protection)$/i },
+  terms: { label: 'terms of service', re: /^(?:terms(?:[-_]?(?:of[-_]?(?:service|use)|and[-_]?conditions|conditions))?|tos|conditions[-_]?of[-_]?use|eula|user[-_]?agreement|legal)$/i },
+  refund: { label: 'refund policy', re: /^(?:refunds?(?:[-_]?policy)?|returns?(?:[-_]?policy)?|cancellation(?:[-_]?policy)?)$/i },
+  cookies: { label: 'cookie policy', re: /^(?:cookies?(?:[-_]?policy)?)$/i },
+};
+const PAGE_EXT_RE = /\.(?:html?|md|mdx|jsx|tsx|vue|svelte|astro|ejs|hbs|njk|liquid|erb|pug)$/;
+const LINK_RE = /(?:\b(?:href|to|path)\s*[=:]\s*\{?\s*|\]\()["'`]?([^"'`\s)>]{1,200})/g;
+// Any other quoted URL or path, such as a policy URL constant: env.TERMS_URL || "https://cal.com/terms".
+const QUOTED_URL_RE = /["'`]((?:https?:\/\/|\/)[^"'`\s<>]{1,200})["'`]/g;
+// Settings that hold a policy URL, often filled from env at deploy time: PRIVACY_POLICY_URL, termsUrl.
+const POLICY_SETTING_RE = /\b[\w$]*?(privacy|terms|refunds?)(?:[-_]?(?:policy|notice|of[-_]?(?:service|use)|and[-_]?conditions|conditions))?[-_]?(?:url|link|href|page)s?\b/gi;
+const HOSTED_POLICY_RE = /(?:app\.termly\.io\/(?:document|policy-viewer)|termly\.io\/[\w/-]*(?:privacy|terms)|iubenda\.com\/(?:privacy-policy|terms-and-conditions)|getterms\.io|termsfeed\.com|privacypolicies\.com|termageddon\.com)[^"'`\s)]*/gi;
+// Files that render pages; a repo with none is an API whose policies live on another site.
+const UI_FILE_RE = /\.(?:jsx|tsx|vue|svelte|astro)$/;
+
+/** Which legal page kinds exist: kind -> evidence line (files, routes and links). */
+function legalPagesFound({ repo, routes, files }) {
+  const found = {};
+  const note = (kind, line) => {
+    if (!found[kind]) found[kind] = line;
+  };
+  const kindsOf = (segments) => Object.keys(LEGAL_PAGES).filter((k) => segments.some((s) => LEGAL_PAGES[k].re.test(s)));
+  for (const f of repo.files) {
+    if (f.build || !PAGE_EXT_RE.test(f.name) || repo.isTest(f)) continue;
+    const segs = f.rel.replace(PAGE_EXT_RE, '').split('/').map((s) => s.replace(/^\+|^\[|\]$|^\(|\)$/g, ''));
+    for (const k of kindsOf(segs)) {
+      note(k, ev(f.rel, null, `${LEGAL_PAGES[k].label} page`));
+      // Terms of service often carry the refund and cancellation policy.
+      if (k === 'terms' && /\brefunds?\b|\bcancell?ation polic(?:y|ies)\b/i.test(repo.read(f) || '')) note('refund', ev(f.rel, null, 'refund terms inside the terms of service'));
+    }
+  }
+  for (const r of routes) for (const k of kindsOf(String(r.path).split('/'))) note(k, ev(r.file.rel, r.line, `${LEGAL_PAGES[k].label} route ${r.path}`));
+  for (const f of files) {
+    const text = repo.code(f) || '';
+    for (const [re, what] of [[LINK_RE, 'link to the'], [QUOTED_URL_RE, 'URL of the']]) {
+      for (const m of text.matchAll(re)) {
+        const url = m[1].split(/[?#]/)[0];
+        if (!url.includes('/')) continue;
+        const segs = url.split('/').map((s) => s.replace(/\.html?$/, ''));
+        for (const k of kindsOf(segs)) note(k, ev(f.rel, repo.lineOf(f, m.index), `${what} ${LEGAL_PAGES[k].label} (${url})`));
+      }
+    }
+    for (const m of text.matchAll(POLICY_SETTING_RE)) {
+      const kind = /^privacy/i.test(m[1]) ? 'privacy' : /^terms/i.test(m[1]) ? 'terms' : 'refund';
+      note(kind, ev(f.rel, repo.lineOf(f, m.index), `${LEGAL_PAGES[kind].label} URL setting (${m[0]})`));
+    }
+    for (const m of text.matchAll(HOSTED_POLICY_RE)) {
+      const kind = /terms/i.test(m[0]) ? 'terms' : 'privacy';
+      note(kind, ev(f.rel, repo.lineOf(f, m.index), `hosted ${LEGAL_PAGES[kind].label} (${m[0].slice(0, 60)})`));
+    }
+  }
+  return found;
+}
+
+function legalPages(ctx) {
+  const { accounts, inputs, payments, tracking } = ctx.data;
+  const needs = new Set();
+  if (accounts.length || inputs.length || tracking.length || payments.length) needs.add('privacy');
+  if (accounts.length || payments.length) needs.add('terms');
+  if (payments.length) needs.add('refund');
+  if (!needs.size) return na('LEGAL-04', 'no signup, accounts, email collection, analytics or payments found');
+  const found = legalPagesFound(ctx);
+  const missing = [...needs].filter((k) => !found[k]);
+  const signals = [...accounts, ...payments, ...inputs, ...tracking].slice(0, 4);
+  if (missing.length) {
+    const names = missing.map((k) => LEGAL_PAGES[k].label);
+    const join = (word) => (names.length > 1 ? `${names.slice(0, -1).join(', ')} ${word} ${names[names.length - 1]}` : names[0]);
+    const { repo } = ctx;
+    const ui = repo.files.some((f) => !f.build && !repo.isTest(f) && (f.kind === 'markup' || UI_FILE_RE.test(f.name)));
+    if (!ui) {
+      return manual('LEGAL-04', [...signals, `No ${join('or')} found, and this repo has no pages of its own (it looks like an API), so they would live on the site or app in front of it.`], {
+        question: `This repo is an API with no pages. Does the site or app in front of it publish a ${join('and')} and link them where users sign up${payments.length ? ' and pay' : ''}?`,
+      });
+    }
+    return fail('LEGAL-04', [...signals, `No ${join('or')} found (looked for pages, routes, links and URLs named privacy, terms, refund or cookies, and hosted policies).`]);
+  }
+  return pass('LEGAL-04', [...needs].map((k) => found[k]));
+}
+
+// ── LEGAL-05 ───────────────────────────────────────────────────────────────
+
+const CONSENT_RE = /consent\.cookiebot\.com|\bCookiebot\b|cdn\.cookielaw\.org|\bOneTrust\b|\bOptanon\w*|cmp\.osano\.com|\bosano\b|cdn-cookieyes\.com|\bcookieyes\b|app\.termly\.io\/(?:embed|resource-blocker)|iubenda\.com\/cs|\bUsercentrics\b|\bdidomi\b|\bklaro\b|vanilla-cookieconsent|['"]cookieconsent['"]|react-cookie-consent|cookiehub|cookie-script\.com|consentmanager\.net|cookiefirst|\bgtag\(\s*['"]consent['"]\s*,\s*['"](?:default|update)['"]|\b(?:Cookie|Consent)(?:Banner|Consent|Notice|Popup|Modal|Bar|Manager|Dialog|Prompt)\b|\bcookie[-_]?(?:banner|consent|notice)\b|\bconsent[-_]?(?:banner|manager)\b/i;
+
+function cookieConsent(ctx) {
+  const { repo, files, trackers } = ctx;
+  if (!trackers.length) return pass('LEGAL-05', ['No analytics or ad trackers that need cookie consent found (cookieless analytics such as Plausible or Vercel Analytics are fine).']);
+  const consent = hits(repo, files, CONSENT_RE).next().value;
+  if (consent) {
+    return pass('LEGAL-05', [ev(consent.f.rel, consent.line, `consent mechanism (${consent.m[0]}) for ${[...new Set(trackers.map((t) => t.name))].join(', ')}`, repo.snippet(consent.f, consent.line))]);
+  }
+  return warn('LEGAL-05', trackers.map((t) => ev(t.f.rel, t.line, `${t.name} loads with no cookie consent banner or CMP`, repo.snippet(t.f, t.line))));
+}
+
+// ── LEGAL-06 ───────────────────────────────────────────────────────────────
+
+const EMAIL_SENDERS = [
+  { name: 'Resend', module: /['"]resend['"]/, call: () => /\.emails\.send\s*\(|\.batch\.send\s*\(|\.broadcasts\.(?:create|send)\s*\(/g, bulk: /\.batch\.send|\.broadcasts\./ },
+  { name: 'SendGrid', module: /['"]@sendgrid\/mail['"]/, call: (text) => new RegExp(`\\b(?:${importedNames(text, '@sendgrid/mail').join('|') || 'sgMail'})\\.send(?:Multiple)?\\s*\\(`, 'g'), bulk: /sendMultiple|isMultiple\s*:\s*true/ },
+  { name: 'Nodemailer', module: /['"]nodemailer['"]/, call: () => /\.sendMail\s*\(/g },
+  { name: 'Postmark', module: /['"]postmark['"]/, call: () => /\.send(?:Email|EmailWithTemplate|EmailBatch|EmailBatchWithTemplates)\s*\(/g, bulk: /Batch/ },
+  { name: 'AWS SES', module: /['"](?:@aws-sdk\/client-sesv?2?|aws-sdk)['"]/, call: () => /\bnew\s+Send(?:Bulk)?(?:Templated)?EmailCommand\s*\(|\.send(?:Raw|Templated|BulkTemplated)?Email\s*\(/g, bulk: /Bulk/ },
+  { name: 'Mailgun', module: /['"](?:mailgun\.js|mailgun-js)['"]/, call: () => /\.messages\.create\s*\(/g },
+  { name: 'Brevo', module: /['"](?:@getbrevo\/brevo|sib-api-v3-sdk|@sendinblue\/client)['"]/, call: () => /\bsendTransacEmail\s*\(|\bcreateEmailCampaign\s*\(/g, bulk: /createEmailCampaign/ },
+  { name: 'Mailchimp Transactional', module: /['"](?:@mailchimp\/mailchimp_transactional|mandrill-api)['"]/, call: () => /\.messages\.send(?:Template)?\s*\(/g },
+];
+const MARKETING_RE = /\b(?:newsletters?|digests?|weekly|monthly|announce(?:ment|ments|ing)?|promo(?:s|tion|tions|tional)?|offers?|sale|discounts?|\d+%\s*off|launch(?:ing|es)?|what'?s new|product updates?|campaigns?|marketing|broadcasts?|re-?engage(?:ment)?|win-?back|we miss you|upgrade to)\b/i;
+const TRANSACTIONAL_RE = /\b(?:reset (?:your )?password|password reset|verify (?:your )?email|verification code|confirm (?:your )?(?:email|account)|magic link|sign[- ]?in link|log ?in link|receipt|invoice|order (?:confirmation|#)|your code|one-time code|security alert)\b/i;
+const AUDIENCE_LOOP_RE = /\bfor\s*\(\s*(?:const|let|var)\s+\w+\s+of\s+[\w.$]{0,60}?\b(?:users|subscribers|customers|members|contacts|recipients|emails|audience|rows|leads|list)\b|\b(?:users|subscribers|customers|members|contacts|recipients|emails|audience|rows|leads)\s*\.\s*(?:forEach|map)\s*\(/i;
+const UNSUBSCRIBE_RE = /unsubscribe|list-unsubscribe|\{\{\{?\s*(?:unsub\w*|RESEND_UNSUBSCRIBE_URL)\s*\}?\}\}|<%asm_group_unsubscribe_raw_url%>|%unsubscribe_url%|\*\|UNSUB\|\*|\bopt[-_ ]?out\b|manage (?:your )?(?:email )?preferences|email[-_]?preferences/i;
+
+/** Local names bound to a module: const x = require('m'), import x from 'm'. */
+function importedNames(text, mod) {
+  const esc = mod.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  const names = [];
+  for (const m of text.matchAll(new RegExp(`\\b(?:const|let|var)\\s+(\\w+)\\s*=\\s*require\\(\\s*['"]${esc}['"]\\s*\\)|\\bimport\\s+(\\w+)\\s+from\\s+['"]${esc}['"]`, 'g'))) names.push(m[1] || m[2]);
+  return names;
+}
+
+/** The function a call sits in (for its name), approximated by the nearest preceding declaration. */
+function enclosingName(text, index) {
+  const before = text.slice(Math.max(0, index - 2000), index);
+  const all = [...before.matchAll(/\b(?:async\s+)?function\s+(\w+)|\b(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>/g)];
+  const last = all[all.length - 1];
+  return last ? last[1] || last[2] : '';
+}
+
+/** Text of the email templates a file imports (relative modules under emails/templates). */
+function templateText(repo, f, text) {
+  let out = '';
+  for (const m of text.matchAll(/(?:from\s+|require\(\s*)['"](\.[^'"]+)['"]/g)) {
+    if (!/email|mail|template|newsletter|digest/i.test(m[1])) continue;
+    const target = resolveModule(repo, f.rel, m[1]);
+    const file = target && repo.get(target);
+    if (file) out += `\n${repo.code(file) || ''}`;
+  }
+  return out;
+}
+
+function unsubscribe(ctx) {
+  const { repo, files } = ctx;
+  const bad = [];
+  let sends = 0;
+  let marketing = 0;
+  for (const f of files) {
+    const text = repo.code(f) || '';
+    for (const s of EMAIL_SENDERS) {
+      if (!s.module.test(text)) continue;
+      for (const m of text.matchAll(s.call(text))) {
+        sends += 1;
+        const args = text.slice(m.index, m.index + 1200);
+        const before = text.slice(Math.max(0, m.index - 400), m.index);
+        const fn = enclosingName(text, m.index);
+        const reasons = [];
+        if (s.bulk && s.bulk.test(m[0])) reasons.push('batch or broadcast API');
+        if (AUDIENCE_LOOP_RE.test(before)) reasons.push('loops over a list of users');
+        const word = MARKETING_RE.exec(`${args.slice(0, 700)} ${fn}`);
+        if (word) reasons.push(`"${word[0]}" wording`);
+        if (!reasons.length || TRANSACTIONAL_RE.test(args.slice(0, 700))) continue;
+        marketing += 1;
+        if (UNSUBSCRIBE_RE.test(args) || UNSUBSCRIBE_RE.test(text) || UNSUBSCRIBE_RE.test(templateText(repo, f, text))) continue;
+        const line = repo.lineOf(f, m.index);
+        if (!repo.suppressed(f, line)) bad.push(ev(f.rel, line, `${s.name} sends marketing email (${reasons.join(', ')}) with no unsubscribe link or List-Unsubscribe header`, repo.snippet(f, line)));
+      }
+    }
+  }
+  if (!sends) return na('LEGAL-06', 'no email-sending code found');
+  if (bad.length) return fail('LEGAL-06', bad);
+  if (!marketing) return pass('LEGAL-06', [`${sends} email send call(s), all transactional by the look of them (resets, receipts, sign-in links), which don't need an unsubscribe link.`]);
+  const rest = sends > marketing ? '; the rest look transactional (resets, receipts, sign-in links)' : '';
+  return pass('LEGAL-06', [`${sends} email send call(s): ${marketing} marketing, each with an unsubscribe option${rest}.`]);
+}
+
+// ── LEGAL-07 ───────────────────────────────────────────────────────────────
+
+const FLOW_PATH_RE = /(?:checkout|pricing|billing|subscribe|subscription|plans?\b|upgrade|cancel|signup|sign-up|register|onboarding|cart|payment|paywall|trial)/i;
+const PRECHECK_WORDS_RE = /newsletter|marketing|updates|offers?|promo|partners?|third[- ]part(?:y|ies)|share my|consent|subscribe|add-?on|insurance|protection|donat|tip\b|upsell|auto-?renew|recurring/i;
+const URGENCY_RE = /\b(?:countdown|only \d+ (?:left|remaining)|limited time|offer ends|expires in|hurry|selling fast)\b/i;
+
+function darkPatterns(ctx) {
+  const { repo, app } = ctx;
+  const flows = app.filter((f) => FLOW_PATH_RE.test(f.rel));
+  const found = [];
+  for (const f of app) {
+    const text = repo.code(f) || '';
+    for (const m of text.matchAll(/<input(?=[\s/>])/g)) {
+      const tag = tagAt(text, m.index);
+      if (!/\btype\s*=\s*\{?\s*["'`]checkbox["'`]/.test(tag)) continue;
+      if (!/\b(?:defaultChecked|checked)\b(?!\s*=\s*\{?\s*false)/.test(tag)) continue;
+      const near = text.slice(m.index, m.index + tag.length + 240);
+      const word = PRECHECK_WORDS_RE.exec(near);
+      if (!word) continue;
+      const line = repo.lineOf(f, m.index);
+      if (!repo.suppressed(f, line)) found.push(ev(f.rel, line, `checkbox is checked by default ("${word[0]}")`, repo.snippet(f, line)));
+    }
+  }
+  for (const f of flows) {
+    const text = repo.code(f) || '';
+    const u = URGENCY_RE.exec(text);
+    if (u) found.push(ev(f.rel, repo.lineOf(f, u.index), `urgency wording ("${u[0]}")`, repo.snippet(f, repo.lineOf(f, u.index))));
+  }
+  if (!flows.length && !found.length) return na('LEGAL-07', 'no checkout, pricing, signup or cancellation flows found');
+  return manual('LEGAL-07', [...found, ...flows.slice(0, 8).map((f) => ev(f.rel, null, 'checkout, signup or subscription flow to review'))]);
+}
+
+// ── LEGAL-08 ───────────────────────────────────────────────────────────────
+
+const SELF_PATH_RE = /(?:^|\/)(?:account|accounts|me|user|users|profile|profiles|self)(?:\/:[\w-]+)?\/?$/i;
+const DELETE_PATH_RE = /(?:delete|close|remove|deactivate|erase)[-_]?(?:my[-_]?)?(?:account|me|user|profile|data)/i;
+const ADMIN_RE = /(?:^|\/)(?:admin|internal|staff|backoffice|moderation)(?:\/|$)/i;
+const DELETE_CODE_RE = /\b(?:deleteAccount|deleteMyAccount|deleteMe|closeAccount|removeAccount|destroyAccount|deleteUserData|eraseUser|deleteMyData)\s*\(|\.auth\.admin\.deleteUser\s*\(|\bcurrentUser\.delete\s*\(|\bdeleteUser\s*\(\s*(?:auth\.currentUser|user\b)|\busers\.deleteUser\s*\(/;
+const DELETE_UI_RE = /delete (?:my |your )?account|close (?:my |your )?account|delete (?:all )?(?:my |your )?data|erase my data/i;
+
+function dataDeletion(ctx) {
+  const { repo, routes, app, data } = ctx;
+  if (!data.accounts.length && !data.inputs.length) return na('LEGAL-08', 'no user accounts or personal data collection found');
+  const found = [];
+  for (const r of routes) {
+    if (ADMIN_RE.test(r.path) || ADMIN_RE.test(r.file.rel)) continue;
+    if ((r.method === 'DELETE' && SELF_PATH_RE.test(r.path)) || DELETE_PATH_RE.test(r.path)) found.push(ev(r.file.rel, r.line, `${r.method} ${r.path} deletes an account`));
+  }
+  for (const h of hits(repo, app.filter((f) => !ADMIN_RE.test(f.rel)), DELETE_CODE_RE)) found.push(ev(h.f.rel, h.line, 'account deletion code', repo.snippet(h.f, h.line)));
+  for (const h of hits(repo, app.filter((f) => !ADMIN_RE.test(f.rel)), DELETE_UI_RE)) found.push(ev(h.f.rel, h.line, `"${h.m[0]}" offered in the UI or policy text`));
+  if (!found.length) found.push('No self-service account deletion found: no DELETE route on account/me/user, deleteAccount handler or "Delete account" UI outside admin code.');
+  return manual('LEGAL-08', [...data.accounts, ...found]);
+}
+
+// ── LEGAL-09 ───────────────────────────────────────────────────────────────
+
+// An age or birthdate the app stores, not just the word: form fields, validator and model keys,
+// SQL and Prisma columns, and request-body reads. A "birthday" holiday keyword doesn't count.
+const AGE = String.raw`(?:date[-_]?of[-_]?birth|birth[-_]?date|birthday|dob|age)`;
+const AGE_FIELD_RE = new RegExp([
+  String.raw`\b(?:name|id|htmlFor|for)\s*=\s*\{?\s*["'\`]${AGE}["'\`]`,
+  String.raw`\bauto[cC]omplete\s*=\s*\{?\s*["'\`]bday(?:-day|-month|-year)?["'\`]`,
+  String.raw`\b(?:register|formData\.get|getFieldProps|useField)\(\s*["'\`]${AGE}["'\`]`,
+  String.raw`\b${AGE}\s*\??\s*:\s*(?:z|yup|Joi|v|t)\.`,
+  String.raw`\b${AGE}\s*:\s*\{?\s*(?:type\s*:\s*)?(?:Date|Number|DataTypes\.\w+|Sequelize\.\w+)\b(?!\s*\()`,
+  String.raw`\b(?:date[-_]?of[-_]?birth|birth[-_]?date|dob)\s*\??\s*:\s*(?:Date|string)\b`,
+  String.raw`\b${AGE}\s*=\s*(?:models\.\w+|db\.Column|Column|mapped_column|fields\.\w+)\(|\bt\.(?:date|datetime|integer)\s+:${AGE}\b`,
+  String.raw`^\s*${AGE}\s+(?:DateTime|Int)\b`,
+  String.raw`\b${AGE}\s+(?:date|timestamp\w*|int(?:eger)?|smallint)\b(?!\s*[=(])`,
+  String.raw`\b(?:req|request|ctx\.request)\.body\.${AGE}\b|\bbody\.${AGE}\b`,
+  String.raw`\{[^{}]{0,300}\b${AGE}\b[^{}]{0,300}\}\s*=\s*(?:await\s+)?(?:(?:req|request|ctx\.request|event)\.body|(?:req|request)\.json\(\)|body|input|values)\b`,
+].join('|'), 'im');
+const AGE_WORD_RE = new RegExp(String.raw`\b${AGE}\b|bday`, 'i');
+const CHILD_CODE_RE = /\b(?:parentalConsent|parental_consent|coppa|isMinor|is_minor|childAccount|child_account|ageVerification|age_verification|ageGate|age_gate)\b/i;
+const CHILD_WORDS = '(?:kids?|children|child\'s|students?|homework|classroom|teachers?|parents?|parental|under (?:the age of )?13|ages? \\d{1,2} ?(?:-|to|–) ?\\d{1,2}|coppa)';
+// Visible copy only: the text after a tag's closing ">" (not an arrow's "=>" or a "->"), with no
+// code characters in it, so "parent component" and `children?.length` in code don't count.
+const CHILD_TEXT_RE = new RegExp(`(?<=[\\w"'}/]|^[ \\t]*)>[^<>{}=;&|()]{0,200}?\\b${CHILD_WORDS}\\b[^<>{}=;&|()]{0,200}<`, 'im');
+
+function childrensData(ctx) {
+  const { repo, app, data } = ctx;
+  if (!data.personal) return na('LEGAL-09', 'no user accounts or personal data collection found');
+  const found = [];
+  for (const h of hits(repo, app, AGE_FIELD_RE)) found.push(ev(h.f.rel, h.line, `age or birthdate field ("${(AGE_WORD_RE.exec(h.m[0]) || h.m)[0]}")`, repo.snippet(h.f, h.line)));
+  for (const h of hits(repo, app, CHILD_CODE_RE)) found.push(ev(h.f.rel, h.line, `child-related code ("${h.m[0]}")`, repo.snippet(h.f, h.line)));
+  const ui = app.filter((f) => f.kind === 'markup' || /\.(?:jsx|tsx|vue|svelte|astro)$/.test(f.name));
+  for (const h of hits(repo, ui, CHILD_TEXT_RE)) {
+    const word = new RegExp(`\\b${CHILD_WORDS}\\b`, 'i').exec(h.m[0]);
+    found.push(ev(h.f.rel, h.line, `child-directed wording ("${word ? word[0] : 'children'}")`, repo.snippet(h.f, h.line)));
+  }
+  if (!found.length) return pass('LEGAL-09', ['No age or birthdate fields and no child-directed wording found. If the app targets children under 13, COPPA requires verifiable parental consent before collecting their data.']);
+  return manual('LEGAL-09', found);
+}
+
+// ── LEGAL-10 ───────────────────────────────────────────────────────────────
+
+const FONT_FILE_RE = /\.(?:woff2?|ttf|otf|eot)$/i;
+const PHOTO_FILE_RE = /\.(?:jpe?g|webp|avif)$/i;
+const STOCK_NAME_RE = /shutterstock|istock|gettyimages|getty|adobestock|adobe[-_]stock|stock[-_]?photo|unsplash|pexels|pixabay|depositphotos|dreamstime|123rf|freepik|alamy|envato|storyblocks/i;
+const OPEN_FONTS_RE = /fonts\.googleapis\.com|['"]next\/font\/google['"]|['"]@fontsource(?:-variable)?\/[\w-]+['"]/;
+
+function assetLicenses(ctx) {
+  const { repo, files } = ctx;
+  const own = repo.files.filter((f) => !f.build && !repo.isTest(f));
+  const fonts = own.filter((f) => FONT_FILE_RE.test(f.name));
+  const photos = own.filter((f) => PHOTO_FILE_RE.test(f.name));
+  const stock = photos.filter((f) => STOCK_NAME_RE.test(f.rel));
+  const open = hits(repo, files, OPEN_FONTS_RE).next().value;
+  if (!fonts.length && !photos.length) {
+    return pass('LEGAL-10', [`No self-hosted font files or photos found${open ? '; fonts load from Google Fonts or open-license packages' : ''}.`]);
+  }
+  const evidence = [
+    ...fonts.slice(0, 8).map((f) => ev(f.rel, null, 'self-hosted font file')),
+    ...stock.slice(0, 8).map((f) => ev(f.rel, null, 'photo named after a stock site')),
+  ];
+  const other = photos.filter((f) => !STOCK_NAME_RE.test(f.rel));
+  if (other.length) evidence.push(`${other.length} other photo(s), e.g. ${other.slice(0, 3).map((f) => f.rel).join(', ')}`);
+  if (fonts.length > 8) evidence.push(`…and ${fonts.length - 8} more font file(s)`);
+  return manual('LEGAL-10', evidence);
+}
+
+// ── LEGAL-11 ───────────────────────────────────────────────────────────────
+
+const SDKS = [
+  { re: /^posthog-js$|^posthog-node$/, cat: 'analytics' },
+  { re: /^mixpanel-browser$|^mixpanel$/, cat: 'analytics' },
+  { re: /^@amplitude\//, cat: 'analytics' },
+  { re: /^@segment\//, cat: 'analytics' },
+  { re: /^react-ga4?$|^vue-gtag$|^react-gtm-module$|^ngx-google-analytics$|^@next\/third-parties$/, cat: 'analytics' },
+  { re: /^@vercel\/analytics$|^@vercel\/speed-insights$/, cat: 'cookieless analytics' },
+  { re: /^@hotjar\/browser$|^@fullstory\/|^logrocket$|^@microsoft\/clarity$|^@highlight-run\//, cat: 'session replay' },
+  { re: /^@sentry\/|^@bugsnag\/|^rollbar$|^@honeybadger-io\//, cat: 'error tracking' },
+  { re: /^@datadog\/browser-|^dd-trace$|^newrelic$|^@newrelic\//, cat: 'monitoring' },
+  { re: /^react-facebook-pixel$/, cat: 'ads' },
+  { re: /^@intercom\/|^react-use-intercom$|^crisp-sdk-web$|^@zendesk\//, cat: 'support chat' },
+  { re: /^@clerk\/|^@auth0\/|^@kinde-oss\/|^@workos-inc\/|^@stackframe\/|^@descope\/|^@stytch\//, cat: 'hosted auth' },
+  { re: /^next-auth$|^@auth\/core$|^@react-oauth\/google$|^passport-google-oauth20$|^passport-facebook$|^passport-github2?$/, cat: 'social login' },
+  { re: /^firebase$|^firebase-admin$|^@supabase\/supabase-js$|^@supabase\/ssr$/, cat: 'hosted backend' },
+  { re: /^openai$|^@anthropic-ai\/sdk$|^@google\/generative-ai$|^@google\/genai$|^@ai-sdk\/(?:openai|anthropic|google|google-vertex|mistral|groq|xai|amazon-bedrock|azure|cohere|deepseek|fireworks|togetherai|perplexity|replicate|cerebras|deepinfra|gateway|vercel|openai-compatible|huggingface|elevenlabs|deepgram|assemblyai|fal)$|^groq-sdk$|^cohere-ai$|^replicate$|^@mistralai\//, cat: 'AI' },
+  { re: /^resend$|^@sendgrid\/mail$|^postmark$|^mailgun\.js$|^@getbrevo\/brevo$|^@mailchimp\//, cat: 'email' },
+  { re: /^twilio$|^@vonage\/|^plivo$|^telnyx$|^messagebird$/, cat: 'SMS' },
+  { re: /^stripe$|^@stripe\/|^@paddle\/|^@lemonsqueezy\/|^@paypal\/|^razorpay$|^braintree$/, cat: 'payments' },
+];
+const DATA_BY_CATEGORY = {
+  analytics: 'page views, device and location data, user IDs and events',
+  'cookieless analytics': 'page views and device data, without cookies',
+  'session replay': 'recordings of what users see and type, unmasked inputs included',
+  'error tracking': 'stack traces and request data, which can include form fields, emails and tokens',
+  monitoring: 'request traces and logs, which can include personal data',
+  ads: 'page views and conversions tied to the visitor, shared with the ad network',
+  'support chat': 'names, emails and conversation history',
+  'hosted auth': 'names, emails, sign-in history and devices',
+  'social login': 'profile name, email and avatar from the identity provider',
+  'hosted backend': 'everything the app stores about its users',
+  AI: 'prompts, including whatever user data the app puts in them',
+  email: 'email addresses and message content',
+  SMS: 'phone numbers and message content',
+  payments: 'names, emails, billing addresses and payment details',
+};
+
+function depLine(pkg, name) {
+  const idx = pkg.text.split('\n').findIndex((l) => l.includes(`"${name}"`));
+  return idx === -1 ? null : idx + 1;
+}
+
+function sdkAudit(ctx) {
+  const { repo, trackers } = ctx;
+  const evidence = [];
+  const seen = new Set();
+  for (const p of repo.packages) {
+    for (const [name, v] of Object.entries(p.versions)) {
+      if (v.section === 'devDependencies' || seen.has(name)) continue;
+      const sdk = SDKS.find((s) => s.re.test(name));
+      if (!sdk) continue;
+      seen.add(name);
+      evidence.push(ev(p.rel, depLine(p, name), `${name} (${sdk.cat}): ${DATA_BY_CATEGORY[sdk.cat]}`));
+    }
+  }
+  for (const t of trackers) {
+    if (seen.has(t.name)) continue;
+    seen.add(t.name);
+    evidence.push(ev(t.f.rel, t.line, `${t.name} (${t.cat} script): ${DATA_BY_CATEGORY[t.cat] || DATA_BY_CATEGORY.analytics}`));
+  }
+  if (!evidence.length) return pass('LEGAL-11', ['No third-party SDKs that receive user data found in package.json or script tags.']);
+  return manual('LEGAL-11', evidence);
+}
+
+module.exports = { name: 'legal', ids: IDS, run, findTrackers, legalPagesFound };
+},
 // ── checks/secrets.js ─────────────────────────────────────────────────────
 "checks/secrets.js": function (module, exports, require) {
 'use strict';
@@ -4250,9 +4985,8 @@ module.exports = { name: 'supabase', ids: IDS, run, analyzeMigrations, stripSqlC
 'use strict';
 
 /**
- * The 59 preflight checks: the single source of truth for ids, titles, severities and
- * the prose in skills/preflight/references/checklist.md and the README table
- * (both generated by tools/gen-docs.js).
+ * Every preflight check: the single source of truth for ids, titles, severities and
+ * the prose in skills/preflight/references/checklist.md (generated by tools/gen-docs.js).
  *
  * mode:
  *   auto        the script decides pass/fail on its own
@@ -4511,6 +5245,32 @@ const CHECKS = [
     detect: 'Script: res.cookie, cookies().set, setCookie and cookie.serialize calls, plus express-session/cookie-session options, that are missing httpOnly, secure or sameSite (or set them to false; shorthand and computed values get the benefit of the doubt); document.cookie writes of tokens; and, with --url, the Set-Cookie headers from the live site.',
     fix: 'Set auth cookies with `{ httpOnly: true, secure: true, sameSite: \'lax\', path: \'/\', maxAge: … }` (use \'strict\' for admin apps). Never set auth tokens from browser JavaScript.',
     question: 'Does this cookie carry a session or auth token? If so, why is it missing HttpOnly/Secure/SameSite?',
+  },
+  {
+    id: 'AUTH-2FA',
+    group: 'auth',
+    title: 'No two-factor authentication',
+    severity: 'medium',
+    mode: 'auto+agent',
+    script: 'auth.js',
+    what: 'Apps with user accounts whose sign-in has no second factor: no authenticator-app (TOTP) codes, one-time codes or passkeys, at enrollment or at login.',
+    why: 'Passwords leak and get reused, so bots try breached email and password pairs against every login form. Microsoft reports that accounts with MFA are more than 99.9% less likely to be compromised. Without it, one leaked password is a full account takeover, and on an admin account a full data breach.',
+    detect: 'Script: identifies the sign-in implementation (Auth.js/NextAuth, Supabase Auth, Firebase Auth, Lucia, better-auth, Passport, or custom password and session/JWT login code) and searches it for 2FA code paths: TOTP libraries (otplib, speakeasy, otpauth), "2fa"/"mfa"/"two factor" flows (also inside names like `twoFactorEnabled`), Supabase `auth.mfa`, Firebase multi-factor, better-auth `twoFactor`, and WebAuthn/passkeys. None found = warn, never fail: not every app needs 2FA. A bare one-time code ("otp") is also how passwordless sign-in works, so on its own it is a warn that asks which it is. Sign-in with no password at all (OAuth or email links only) passes with a note: the identity provider holds the second factor. Hosted sign-in (Clerk, Auth0, Kinde, WorkOS, Stack Auth, Descope, Stytch, Cognito) configures MFA in its dashboard, so it becomes a manual question.',
+    fix: 'Offer authenticator-app codes (TOTP) or passkeys, at least for admins and accounts that hold money or personal data: Supabase `auth.mfa.enroll()` and `challengeAndVerify()`, better-auth `twoFactor()`, Firebase multi-factor, or `otplib` with hashed recovery codes for custom auth; on Clerk or Auth0, turn MFA on in the dashboard. Ask for the second factor again before sensitive changes (email, password, payout details).',
+    question: 'This app has user accounts but no 2FA enrollment or verification code. Is 2FA expected for its risk profile?',
+  },
+  {
+    id: 'AUTH-PW',
+    group: 'auth',
+    title: 'Weak password policy',
+    severity: 'medium',
+    mode: 'auto+agent',
+    script: 'auth.js',
+    what: 'Signup, password-change and reset code that accepts any password: no strength check (zxcvbn, a minimum of 12 or more characters) and no screening against breached passwords.',
+    why: 'Credential stuffing works because people reuse passwords that are already in breach dumps. NIST SP 800-63B-4 requires rejecting passwords found in lists of compromised values, at least 15 characters when the password is the only factor, and recommends allowing at least 64 so passphrases fit. A short maximum (say 20) breaks passphrases and password managers.',
+    detect: 'Script: finds code that sets passwords (signup, register, reset and change-password routes, bcrypt/argon2/scrypt hashing of a password, Supabase `auth.signUp` or `updateUser` with a password, Firebase `createUserWithEmailAndPassword`, better-auth `signUpEmail`) and looks for strength enforcement (zxcvbn, password-validator, `isStrongPassword`, a minimum length of 12 or more, complexity rules such as `/[A-Z]/.test(password)`, checked in auth code first) and breach screening (the Have I Been Pwned range API, hibp packages, better-auth `haveIBeenPwned`). Missing both = warn. Maximum lengths under 32 are noted. With a managed provider and no checks in code, the rules live in its dashboard, so it becomes a manual question.',
+    fix: 'Require at least 12 characters (NIST asks for 15 when the password is the only factor), allow at least 64, and reject breached passwords: query `https://api.pwnedpasswords.com/range/<first 5 hex chars of the SHA-1>` (k-anonymity: the password and its full hash never leave your server), or use zxcvbn to block weak ones. Skip composition rules. On Supabase, set the minimum length and turn on leaked password protection in the Auth settings.',
+    question: 'Do signup, password change and reset all enforce a minimum length of 12 or more and reject breached passwords (in code, or in the auth provider\'s settings)?',
   },
 
   // ── Data & database ──────────────────────────────────────────────────────
@@ -4961,6 +5721,110 @@ const CHECKS = [
     detect: 'Script: PaymentIntent, Checkout Session, PayPal and Razorpay creation with amount, unit_amount or price taken from the request; client code that posts amount, price or total to checkout endpoints; and coupon checks in client code. Always manual: the agent confirms where the amount is decided.',
     fix: 'Send only product or price IDs and quantities from the client. Look prices up on the server (or use Stripe Price IDs), compute totals and discounts server-side, and treat Stripe webhooks, not the browser redirect, as the source of truth for fulfillment.',
     question: 'Does the server recompute the charged amount from its own prices, or does it trust the amount the browser sent?',
+  },
+  {
+    id: 'LEGAL-04',
+    group: 'legal',
+    title: 'Missing privacy policy, terms or refund policy',
+    severity: 'high',
+    mode: 'auto',
+    script: 'legal.js',
+    what: 'Apps that collect personal data (accounts, signup or email forms, analytics) or take payments, with no privacy policy, terms of service or refund policy page.',
+    why: 'California\'s CalOPPA requires any site or app that collects personal information from California residents to post a privacy policy, GDPR requires one where data is collected, and the App Store and Google Play reject apps without one. Stripe requires a refund and dispute policy, and a cancellation policy for subscriptions, on your site before you start selling.',
+    detect: 'Script: looks for data collection (signup, login and register routes, auth SDKs, email and password inputs, analytics tags) and payments (Stripe, Paddle, Lemon Squeezy, PayPal, Razorpay), then for legal pages: routes or files named privacy, terms/tos, refund(s) or cookies, links and URL constants pointing at them (`PRIVACY_POLICY_URL`, `"https://example.com/terms"`), and hosted policies (Termly, iubenda, GetTerms, TermsFeed). A privacy policy and terms are required with data collection or payments, a refund policy with payments (refund terms inside an in-repo terms page count). Any missing = fail; in a repo with no pages at all (an API), the policies live on another site, so it becomes a manual question. No data collection and no payments = pass with a note.',
+    fix: 'Publish a privacy policy, terms of service and, if you take payments, a refund and cancellation policy, and link them from the footer, signup and checkout. Free attorney-written CC0 templates: https://github.com/General-Legal/legal-templates. The privacy policy has to name the data you collect and every third party it goes to (LEGAL-11).',
+    question: 'Does the app link a privacy policy, terms and (if it takes payments) a refund policy from its footer, signup and checkout?',
+  },
+  {
+    id: 'LEGAL-05',
+    group: 'legal',
+    title: 'Tracking without cookie consent',
+    severity: 'high',
+    mode: 'auto+agent',
+    script: 'legal.js',
+    what: 'Analytics and ad trackers (Google Analytics and Tag Manager, Meta Pixel, Hotjar, Segment, Mixpanel, Amplitude, PostHog, TikTok, LinkedIn, Microsoft Clarity…) that load with no consent banner or consent management platform.',
+    why: 'In the EU and UK, non-essential cookies need consent before they are set: the CNIL fined Google €150M and Facebook €60M in 2022 just for making cookies harder to refuse than to accept. In the US, Meta Pixel and session-replay scripts have drawn wiretapping and video-privacy class actions.',
+    detect: 'Script: finds tracker snippets and SDKs in HTML and code (gtag.js and GTM, fbq and fbevents.js, Hotjar, Segment, Mixpanel, Amplitude, PostHog, Heap, FullStory, LogRocket, TikTok, LinkedIn Insight, Microsoft Clarity, X and Pinterest tags) and looks for a consent mechanism: a CMP (Cookiebot, OneTrust, Osano, CookieYes, Termly, iubenda, Usercentrics, Didomi, Klaro, vanilla-cookieconsent, react-cookie-consent), Google Consent Mode defaults, or a custom consent banner component. Cookieless analytics (Plausible, Fathom, Simple Analytics, Umami, Vercel Analytics) need no consent. Trackers without a consent mechanism = warn.',
+    fix: 'Load trackers only after consent: add a CMP (Cookiebot, CookieYes, Osano, vanilla-cookieconsent) or a banner that sets Google Consent Mode defaults (`gtag(\'consent\', \'default\', { ad_storage: \'denied\', analytics_storage: \'denied\', ad_user_data: \'denied\', ad_personalization: \'denied\' })`) before any tag fires, with Reject as easy as Accept. Or switch to cookieless analytics (Plausible, Fathom, Vercel Analytics).',
+    question: 'Do these trackers wait for consent (a CMP or banner that blocks them until the visitor accepts), and is Reject as easy as Accept?',
+  },
+  {
+    id: 'LEGAL-06',
+    group: 'legal',
+    title: 'Marketing email without unsubscribe',
+    severity: 'medium',
+    mode: 'auto',
+    script: 'legal.js',
+    what: 'Bulk or marketing email (newsletters, digests, announcements, promotions, sends that loop over every user) with no unsubscribe link or List-Unsubscribe header.',
+    why: 'CAN-SPAM requires a working opt-out in every commercial email, and the FTC can seek up to $53,088 per email. Since 2024 Gmail and Yahoo require one-click unsubscribe (List-Unsubscribe-Post, RFC 8058) from anyone sending more than 5,000 messages a day, and reject or spam-folder mail that doesn\'t comply.',
+    detect: 'Script: finds email sends (Resend, SendGrid, Nodemailer, Postmark, AWS SES, Mailgun, Brevo, Mailchimp Transactional) and treats one as marketing when it loops over users, uses a batch or broadcast API, or its subject, template or function name says newsletter, digest, announcement, promo, offer, sale or launch. A marketing send with no unsubscribe link, unsubscribe placeholder or List-Unsubscribe header in the send or its template = fail. Transactional mail (password resets, receipts, magic links) passes; no email code = pass with a note.',
+    fix: 'Put an unsubscribe link in every marketing email and send `List-Unsubscribe: <https://your-app.com/unsubscribe?token=…>` with `List-Unsubscribe-Post: List-Unsubscribe=One-Click`. Honor opt-outs within 10 business days (CAN-SPAM) and check the opt-out list before every send. Broadcast APIs (Resend Broadcasts, SendGrid Marketing, Postmark broadcast streams) can add both for you.',
+    question: 'Is this a marketing or bulk email? If so, where are its unsubscribe link and List-Unsubscribe header?',
+  },
+  {
+    id: 'LEGAL-07',
+    group: 'legal',
+    title: 'Dark patterns and hidden fees',
+    severity: 'high',
+    mode: 'manual',
+    script: 'legal.js',
+    what: 'Checkout, signup and cancellation flows that use pre-checked boxes, reveal fees at the last step, invent urgency, or make cancelling harder than signing up.',
+    why: 'The FTC treats these as deceptive: in 2025 Amazon paid $2.5B (a $1B civil penalty plus $1.5B in refunds) over Prime sign-up and cancellation dark patterns. ROSCA requires clear terms and a simple way to stop recurring charges, and California\'s auto-renewal law requires online cancellation for anything signed up for online.',
+    detect: 'Script: lists checkout, pricing, subscription, signup and cancellation code, and flags checkboxes checked by default next to marketing, newsletter, consent or add-on wording, and urgency wording (countdowns, "only N left") in those flows. Always manual: the agent walks the flows.',
+    fix: 'Leave optional boxes unchecked, show the full price (fees, taxes, renewal price and date) before the pay button, drop countdowns and scarcity claims that aren\'t true, and let users cancel online in no more steps than it took to sign up.',
+    question: 'Walking these flows: is any box pre-checked, is every fee shown before the final step, is any urgency real, and can a user cancel as easily as they subscribed?',
+  },
+  {
+    id: 'LEGAL-08',
+    group: 'legal',
+    title: 'No way to delete your data',
+    severity: 'medium',
+    mode: 'manual',
+    script: 'legal.js',
+    what: 'Apps that store accounts or personal data with no way for a user to delete it: no delete-account route, settings action or documented request process.',
+    why: 'GDPR (Article 17) and the CCPA give users the right to have their data deleted, and since 2022 the App Store has required in-app account deletion for any app that lets people create an account. Data you keep without a reason is also exactly what leaks in a breach.',
+    detect: 'Script: when the app has accounts or stores user data, looks for self-service deletion outside admin code (DELETE routes on account, me, user or profile, deleteAccount and deleteUser handlers, Supabase `auth.admin.deleteUser`, Firebase `deleteUser`, Clerk `users.deleteUser`, "Delete account" UI) and lists what it finds. Always manual.',
+    fix: 'Add a "Delete account" action in settings that removes the user, their rows and their stored files, cancels subscriptions, and asks processors (Stripe, email and analytics providers) to delete their copies, or document an email request process (GDPR gives you one month to respond). Log that the deletion happened without keeping the data.',
+    question: 'Can a user delete their account and data (a settings action, an API route or a documented request process), and does that also remove copies in storage and third-party services?',
+  },
+  {
+    id: 'LEGAL-09',
+    group: 'legal',
+    title: 'Children\'s data without parental consent (COPPA)',
+    severity: 'critical',
+    mode: 'manual',
+    script: 'legal.js',
+    what: 'Apps directed at children, or that collect an age or birthdate and may have users under 13, without verifiable parental consent.',
+    why: 'COPPA penalties reach $53,088 per violation, and each child can count. The FTC has taken $275M from Epic Games and $10M from Disney over children\'s data. In Europe, GDPR requires parental consent below 13 to 16 depending on the country, and the UK Children\'s Code adds design duties.',
+    detect: 'Script: when the app collects user data, looks for an age or birthdate the app stores (form fields, validator and model keys, SQL and Prisma columns, request-body reads) and child-directed wording in visible page copy (kids, children, students, homework, parents, under 13, COPPA), and lists them. Found = manual question; none = pass with a note.',
+    fix: 'If children under 13 may use the app, get verifiable parental consent before collecting their data, collect the minimum, turn off ads and third-party tracking for them, and let parents review and delete it. If the app is not for children, add a neutral age gate (ask for a date of birth, not "I am over 13") and block under-13 sign-ups.',
+    question: 'Is this app directed at children, or could users under 13 sign up? If so, is verifiable parental consent collected before any of their data is stored?',
+  },
+  {
+    id: 'LEGAL-10',
+    group: 'legal',
+    title: 'Unlicensed fonts and images',
+    severity: 'medium',
+    mode: 'manual',
+    script: 'legal.js',
+    what: 'Self-hosted font files and photos in the repo whose licenses can\'t be checked from code.',
+    why: 'Font foundries and stock agencies search the web for their files and send demand letters for unlicensed use, and a desktop font license usually doesn\'t cover self-hosting the font on a website. Google Fonts, open-license (OFL) fonts and system fonts are free to use.',
+    detect: 'Script: lists self-hosted font files (.woff, .woff2, .ttf, .otf, .eot) and photos (.jpg, .jpeg, .webp, .avif) outside build output, and flags names that point to stock sites (Shutterstock, iStock, Getty, Adobe Stock, Unsplash, Pexels…). A reminder with evidence, not a verdict: licenses can\'t be verified statically. None = pass with a note.',
+    fix: 'Keep the license or receipt for every commercial font and stock image and check that font licenses cover web embedding at your traffic, or switch to Google Fonts or other OFL fonts and to images you own or have licensed.',
+    question: 'Do you hold licenses that cover web use for these self-hosted fonts and images (stock photos, icon packs)?',
+  },
+  {
+    id: 'LEGAL-11',
+    group: 'legal',
+    title: 'Third-party SDK data sharing',
+    severity: 'medium',
+    mode: 'manual',
+    script: 'legal.js',
+    what: 'Third-party SDKs (analytics, ads, error tracking and session replay, support chat, social login, AI, email and SMS, payments, hosted backends) that receive user data, and whether each one is disclosed.',
+    why: 'Every SDK you ship sees some user data, and your privacy policy has to name them. In 2023 GoodRx paid a $1.5M FTC penalty and BetterHelp $7.8M over health data passed to advertising pixels, and error trackers and session replay often capture form fields, tokens and personal data by default.',
+    detect: 'Script: lists the third-party SDKs in package.json and tracker script tags by category, with the kind of user data each one typically receives. Always manual: the agent checks each against the privacy policy. This is about data flow; vulnerable versions are DEP-01.',
+    fix: 'For each SDK, send only what it needs (scrub personal data in Sentry\'s `beforeSend`, mask inputs in session replay, keep emails out of analytics), name it in your privacy policy, sign its DPA if you have EU users, and remove the ones you no longer use.',
+    question: 'For each SDK listed, what user data does it receive, is it named in your privacy policy, and is a DPA in place where needed?',
   },
 
   // ── Dependencies & supply chain ──────────────────────────────────────────
@@ -7074,6 +7938,13 @@ function blankJs(text, out) {
     if (ch === '`') {
       i = skipTemplate(text, i, n) + 1;
       prev = '`';
+      continue;
+    }
+    // JSX closing (</a>) and self-closing (/>) tags are never regex literals; treating them as
+    // one blanked everything up to the next "/" on the line (<a href="/x">A</a> <a href="/y">).
+    if (ch === '/' && (text[i - 1] === '<' || next === '>')) {
+      prev = '/';
+      i++;
       continue;
     }
     if (ch === '/' && REGEX_PREV.has(prev)) {

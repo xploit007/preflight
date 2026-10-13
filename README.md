@@ -1,6 +1,6 @@
 # preflight
 
-The pre-launch checklist for vibe-coded apps. 59 checks, 30 seconds, zero dependencies.
+The pre-launch checklist for vibe-coded apps. 69 checks, 30 seconds, zero dependencies.
 
 [![GitHub stars](https://img.shields.io/github/stars/xploit007/preflight?style=flat)](https://github.com/xploit007/preflight/stargazers) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -41,15 +41,15 @@ node preflight/scripts/scan.js /path/to/your-app
 ## What it checks
 
 - **Secrets (8):** keys in source, git history and bundles, committed `.env` files, public env prefixes.
-- **Auth & sessions (10):** missing auth checks, open admin routes, IDOR, broken password resets, insecure cookies.
+- **Auth & sessions (12):** missing auth checks, open admin routes, IDOR, broken password resets, insecure cookies, no 2FA, weak password rules.
 - **Database (7):** Supabase RLS off, the service-role key in browser code, open Firebase rules.
 - **Costs & infra (5):** no rate limits, no spend caps, unbounded serverless runs, DDoS bandwidth bills.
 - **Injection & app security (19):** XSS, SQL and NoSQL injection, SSRF, unsigned webhooks, permissive CORS, missing headers.
-- **Legal (3):** SMS without opt-in consent (TCPA), ADA accessibility basics, prices trusted from the browser.
+- **Legal (11):** privacy pages, cookie consent, unsubscribe links, SMS consent (TCPA), ADA basics, kids' data, dark patterns, prices set in the browser.
 - **Dependencies (3):** known-vulnerable packages, missing lockfiles, typosquatted names.
 - **AI keys (4):** AI keys in client code or git, prompt injection, unpermissioned tools, uncapped LLM spend.
 
-All 59 checks with their fixes: [checklist.md](skills/preflight/references/checklist.md). Flags, output format and suppressions: [docs/usage.md](docs/usage.md).
+All 69 checks with their fixes: [checklist.md](skills/preflight/references/checklist.md). Flags, output format and suppressions: [docs/usage.md](docs/usage.md).
 
 ## Example finding
 
@@ -67,7 +67,7 @@ Real output from the demo scan of [`fixtures/vulnerable`](fixtures/vulnerable); 
 
 | | What it does | Needs |
 | --- | --- | --- |
-| **preflight** | 59 deterministic pre-launch checks in seconds, including non-code risks (spend caps, SMS consent, accessibility) | Node 18+ |
+| **preflight** | 69 deterministic pre-launch checks in seconds, including non-code risks (spend caps, SMS consent, accessibility) | Node 18+ |
 | [Cloudflare security-audit-skill](https://github.com/cloudflare/security-audit-skill) | Deep, adversarial vulnerability hunting in code, every finding independently verified | A coding agent and a multi-phase audit |
 | [Strix](https://github.com/usestrix/strix) | Live agentic pentesting of your running app, with working proofs of concept | Docker and an LLM API key |
 

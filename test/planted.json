@@ -51,6 +51,12 @@
     { "check": "LEGAL-03", "file": "server/payments.js", "line": 8, "status": ["manual"], "what": "PaymentIntent amount taken from the request" },
     { "check": "DEP-02", "file": "package.json", "line": 1, "status": ["fail"], "what": "dependencies without a lockfile" },
     { "check": "AI-01", "file": "server/chat.js", "line": 10, "status": ["warn"], "what": "request data in the system prompt without delimiters" },
-    { "check": "AI-04", "file": "server/chat.js", "line": 7, "status": ["warn"], "what": "LLM call without max_tokens, model from the request" }
+    { "check": "AI-04", "file": "server/chat.js", "line": 7, "status": ["warn"], "what": "LLM call without max_tokens, model from the request" },
+    { "check": "AUTH-2FA", "file": "server/index.js", "line": 20, "status": ["warn"], "what": "custom password login with no second factor" },
+    { "check": "AUTH-PW", "file": "server/signup.js", "line": 7, "status": ["warn"], "what": "signup sets a password with no strength check or breach screening (and caps it at 20 characters)" },
+    { "check": "LEGAL-04", "file": "src/components/Signup.jsx", "line": 5, "status": ["fail"], "what": "signup form and payments with no privacy policy, terms or refund policy" },
+    { "check": "LEGAL-05", "file": "index.html", "line": 7, "status": ["warn"], "what": "Google Analytics loads with no cookie consent banner" },
+    { "check": "LEGAL-06", "file": "server/newsletter.js", "line": 10, "status": ["fail"], "what": "weekly newsletter to every user with no unsubscribe link" },
+    { "check": "LEGAL-07", "file": "src/components/Signup.jsx", "line": 9, "status": ["manual"], "what": "newsletter checkbox checked by default" }
   ]
 }

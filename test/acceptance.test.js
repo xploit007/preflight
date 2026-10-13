@@ -144,10 +144,11 @@ test('README install commands match the repo layout', () => {
   assert.ok(fs.existsSync(path.join(ROOT, 'commands', 'scan.md')));
 });
 
-test('every one of the 59 checks appears in references/checklist.md, and the README counts match the catalog', () => {
-  assert.equal(CHECKS.length, 59);
+test('every one of the 69 checks appears in references/checklist.md, and the README counts match the catalog', () => {
+  assert.equal(CHECKS.length, 69);
   const checklist = fs.readFileSync(path.join(ROOT, 'skills', 'preflight', 'references', 'checklist.md'), 'utf8');
-  const headings = [...checklist.matchAll(/^### ([A-Z]+-\d+): /gm)].map((m) => m[1]);
+  // ids are GROUP-NN or mnemonic (AUTH-2FA, AUTH-PW)
+  const headings = [...checklist.matchAll(/^### ([A-Z]+-[A-Z0-9]+): /gm)].map((m) => m[1]);
   assert.deepEqual(headings, CHECKS.map((c) => c.id));
   for (const c of CHECKS) {
     const section = checklist.slice(checklist.indexOf(`### ${c.id}: `)).split('\n### ')[0];
@@ -157,7 +158,7 @@ test('every one of the 59 checks appears in references/checklist.md, and the REA
   // numbers (the tagline and the per-group counts) come from the catalog.
   const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
   assert.ok(readme.includes('](skills/preflight/references/checklist.md)'));
-  assert.ok(!/^\| [A-Z]+-\d+ \|/m.test(readme), 'no per-check table in the README');
+  assert.ok(!/^\| [A-Z]+-[A-Z0-9]+ \|/m.test(readme), 'no per-check table in the README');
   assert.ok(readme.includes(`${CHECKS.length} checks`));
   const counts = [...readme.matchAll(/^- \*\*[^*]+ \((\d+)\):\*\*/gm)].map((m) => Number(m[1]));
   assert.deepEqual(counts, GROUPS.map((g) => CHECKS.filter((c) => c.group === g.key).length));

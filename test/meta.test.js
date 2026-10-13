@@ -39,6 +39,16 @@ test('generated files are up to date (checklist, command, skill, bundle)', () =>
   }
 });
 
+test('the check count is the same everywhere it is stated', () => {
+  const { CHECKS } = require('../scripts/lib/catalog');
+  for (const doc of ['README.md', 'docs/usage.md', 'skills/preflight/SKILL.md', 'skills/preflight/references/checklist.md', 'commands/scan.md']) {
+    const counts = [...read(doc).matchAll(/\b(\d+) checks\b/g)].map((m) => Number(m[1]));
+    for (const n of counts) assert.equal(n, CHECKS.length, `${doc} says ${n} checks`);
+  }
+  const bundled = scan(['fixtures/clean', '--json', '--offline'], { script: path.join(ROOT, 'skills', 'preflight', 'scripts', 'scan.js') });
+  assert.equal(bundled.json.results.length, CHECKS.length, 'the bundled scanner reports every check');
+});
+
 test('the bundled skill scanner gives exactly the same results as scripts/scan.js', () => {
   for (const target of ['fixtures/vulnerable', 'fixtures/clean']) {
     const a = scan([target, '--json', '--offline']);

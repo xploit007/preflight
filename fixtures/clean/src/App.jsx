@@ -31,6 +31,9 @@ export default function App() {
           <Comment key={n.id} comment={n} />
         ))}
       </section>
+      <footer>
+        <a href="/privacy.html">Privacy</a> · <a href="/terms.html">Terms</a> · <a href="/refunds.html">Refunds</a>
+      </footer>
     </main>
   );
 }

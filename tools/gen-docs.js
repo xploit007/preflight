@@ -70,6 +70,10 @@ function checklistMarkdown() {
     }
   }
   out.push('');
+  out.push('## Deliberately not covered');
+  out.push('');
+  out.push('- **Fake reviews and unsupported marketing claims.** Whether a testimonial is real or a claim is substantiated is content moderation, not code, so a repo scanner has no business judging it. This is a deliberate exclusion, not a gap.');
+  out.push('');
   return out.join('\n');
 }
 
@@ -179,7 +183,7 @@ ${playbook({ scanner: '${CLAUDE_PLUGIN_ROOT}/scripts/scan.js', checklist: '${CLA
 function skillMarkdown() {
   return `---
 name: preflight
-description: Pre-launch security and cost-risk scanner for vibe-coded web apps (59 checks covering leaked secrets, Supabase RLS, rate limits, spend caps, XSS/SQLi/SSRF, TCPA SMS consent, ADA accessibility, dependencies and prompt injection). Use when the user asks to audit, scan, or harden a web app before launch, or mentions preflight, /scan, or pre-launch security review.
+description: Pre-launch security and cost-risk scanner for vibe-coded web apps (${CHECKS.length} checks covering leaked secrets, Supabase RLS, rate limits, spend caps, XSS/SQLi/SSRF, 2FA and password policy, privacy and cookie consent, TCPA SMS consent, ADA accessibility, dependencies and prompt injection). Use when the user asks to audit, scan, or harden a web app before launch, or mentions preflight, /scan, or pre-launch security review.
 allowed-tools: Read, Grep, Glob, Bash(node "\${CLAUDE_SKILL_DIR}/scripts/scan.js" *)
 ---
 

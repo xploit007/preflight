@@ -37,6 +37,7 @@ const GROUPS = [
   require('./checks/appsec'),
   require('./checks/infra'),
   require('./checks/comms'),
+  require('./checks/legal'),
   require('./checks/a11y'),
   require('./checks/ai'),
 ];

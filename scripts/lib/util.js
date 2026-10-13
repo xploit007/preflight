@@ -246,6 +246,13 @@ function blankJs(text, out) {
       prev = '`';
       continue;
     }
+    // JSX closing (</a>) and self-closing (/>) tags are never regex literals; treating them as
+    // one blanked everything up to the next "/" on the line (<a href="/x">A</a> <a href="/y">).
+    if (ch === '/' && (text[i - 1] === '<' || next === '>')) {
+      prev = '/';
+      i++;
+      continue;
+    }
     if (ch === '/' && REGEX_PREV.has(prev)) {
       let j = i + 1;
       let inClass = false;

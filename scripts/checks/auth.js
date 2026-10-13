@@ -15,7 +15,7 @@ const { pass, fail, warn, manual, na, ev } = require('../lib/result');
 const { splitArgs, literalValue } = require('../lib/util');
 const { collectColumns } = require('./data');
 
-const IDS = ['AUTH-01', 'AUTH-02', 'AUTH-03', 'AUTH-04', 'AUTH-05', 'AUTH-06', 'AUTH-07', 'AUTH-08', 'AUTH-09', 'AUTH-10'];
+const IDS = ['AUTH-01', 'AUTH-02', 'AUTH-03', 'AUTH-04', 'AUTH-05', 'AUTH-06', 'AUTH-07', 'AUTH-08', 'AUTH-09', 'AUTH-10', 'AUTH-2FA', 'AUTH-PW'];
 
 // Routes that are public by design (auth flows, webhooks with signatures, health checks, public forms).
 const PUBLIC_PATH_RE = /(?:^|\/)(?:login|log-in|logout|signin|sign-in|signup|sign-up|register|join|auth|oauth|callback|forgot[\w-]*|reset[\w-]*|verify[\w-]*|confirm[\w-]*|magic[\w-]*|otp|webhooks?|[\w-]*webhook[\w-]*|health|healthz|status|ping|ready|version|robots\.txt|sitemap[\w.]*|og|contact|subscribe|newsletter|waitlist|unsubscribe|csp-report|cron)(?:\/|$|\.)/i;
@@ -35,7 +35,7 @@ async function run(root, opts = {}) {
   const { routes, nextMiddleware } = getRoutes(repo);
   const server = repo.sources({ kinds: ['code'], tests: false, js: true }).filter((f) => repo.side(f) !== 'client' && !repo.isTooling(f));
   const ctx = { repo, routes, nextMiddleware, server, opts };
-  return [weakAuth(ctx), missingAuthz(ctx), crossUser(ctx), adminRoutes(ctx), passwordReset(ctx), sessions(ctx), idor(ctx), massAssignment(ctx), oauth(ctx), await cookies(ctx)];
+  return [weakAuth(ctx), missingAuthz(ctx), crossUser(ctx), adminRoutes(ctx), passwordReset(ctx), sessions(ctx), idor(ctx), massAssignment(ctx), oauth(ctx), await cookies(ctx), twoFactor(ctx), passwordPolicy(ctx)];
 }
 
 const chain = (r) => `${r.mountMiddleware || ''}\n${routeBody(r)}`;
@@ -108,6 +108,268 @@ function missingAuthz(ctx) {
   }
   if (open.length) return warn('AUTH-02', open);
   return pass('AUTH-02', [`Checked ${considered} state-changing or user-data route(s): each has an auth check in its handler, middleware chain or mount.`]);
+}
+
+
+// ── Sign-in implementation (shared with legal.js) ────────────────────────────
+
+// Hosted sign-in: MFA and password rules are dashboard settings, not code.
+const HOSTED_AUTH = [
+  { name: 'Clerk', re: /['"]@clerk\/[\w-]+['"]|\bclerkMiddleware\s*\(/ },
+  { name: 'Auth0', re: /['"]@auth0\/[\w-]+['"]/ },
+  { name: 'Kinde', re: /['"]@kinde-oss\/[\w-]+['"]/ },
+  { name: 'WorkOS', re: /['"]@workos-inc\/[\w-]+['"]/ },
+  { name: 'Stack Auth', re: /['"]@stackframe\/[\w-]+['"]/ },
+  { name: 'Descope', re: /['"]@descope\/[\w-]+['"]/ },
+  { name: 'Stytch', re: /['"]@stytch\/[\w-]+['"]/ },
+  { name: 'Amazon Cognito', re: /['"](?:aws-amplify|@aws-amplify\/[\w-]+|amazon-cognito-identity-js)['"]/ },
+];
+// Auth libraries and managed backends whose sign-in flows live in the app's own code.
+const LIBRARY_AUTH = [
+  { name: 'Supabase Auth', re: /\bsupabase\.auth\.\w+|\.auth\.(?:getUser|getSession|signInWithPassword|signInWithOtp|signInWithOAuth|signUp)\s*\(/ },
+  { name: 'Auth.js (NextAuth)', re: /['"](?:next-auth|next-auth\/[\w-]+|@auth\/[\w-]+)['"]|\bNextAuth\s*\(/ },
+  { name: 'Firebase Auth', re: /['"](?:firebase\/auth|firebase-admin\/auth)['"]/ },
+  { name: 'better-auth', re: /['"]better-auth(?:\/[\w-]+)?['"]/ },
+  { name: 'Lucia', re: /['"]lucia['"]|\bnew\s+Lucia\s*\(/ },
+  { name: 'SuperTokens', re: /['"]supertokens-[\w-]+['"]/ },
+  { name: 'Passport', re: /['"]passport['"]|\bpassport\.authenticate\s*\(/ },
+];
+const LOGIN_PATH_RE = /(?:^|\/)(?:login|log-in|signin|sign-in|sessions?|authenticate)(?:\/|$)|^action:(?:log_?in|sign_?in|authenticate)/i;
+const SIGNUP_PATH_RE = /(?:^|\/)(?:signup|sign-up|register|registration)(?:\/|$)|^action:(?:sign_?up|register)/i;
+
+const implCache = new WeakMap();
+
+/**
+ * How users sign in: { provider, hosted, f, line, label, evidence } for the first hosted provider,
+ * auth library or custom login/signup route found, or null when the app has no user accounts.
+ */
+function authImplementation(repo, routes) {
+  if (implCache.has(repo)) return implCache.get(repo);
+  const files = repo.sources({ kinds: ['code'], tests: false }).filter((f) => !repo.isTooling(f));
+  const firstHit = (re) => {
+    for (const f of files) {
+      const text = repo.code(f) || '';
+      const m = re.exec(text);
+      if (m) return { f, line: repo.lineOf(f, m.index) };
+    }
+    return null;
+  };
+  let impl = null;
+  for (const [list, hosted] of [[HOSTED_AUTH, true], [LIBRARY_AUTH, false]]) {
+    for (const p of list) {
+      const hit = firstHit(p.re);
+      if (!hit) continue;
+      impl = { provider: p.name, hosted, f: hit.f, line: hit.line, label: p.name, evidence: [ev(hit.f.rel, hit.line, `${p.name} sign-in`, repo.snippet(hit.f, hit.line))] };
+      break;
+    }
+    if (impl) break;
+  }
+  if (!impl) {
+    const route = routes.find((r) => isWrite(r) && LOGIN_PATH_RE.test(r.path)) || routes.find((r) => isWrite(r) && SIGNUP_PATH_RE.test(r.path));
+    if (route) impl = { provider: 'custom', hosted: false, f: route.file, line: route.line, label: routeLabel(route), evidence: [ev(route.file.rel, route.line, `${routeLabel(route)} signs users in with a password and no second factor`, repo.snippet(route.file, route.line))] };
+  }
+  implCache.set(repo, impl);
+  return impl;
+}
+
+// ── AUTH-2FA ───────────────────────────────────────────────────────────────
+
+// Strong signals name a second factor outright. Weak ones (one-time codes) are just as common in
+// passwordless sign-in and email verification, so on their own they raise a question, not a pass.
+const STRONG_2FA_TERMS = /otplib|speakeasy|otpauth|simplewebauthn|totp|2fa|mfa|two[-_ ]?factor|multi[-_ ]?factor|webauthn|passkeys?/gi;
+const STRONG_2FA_CALL_RE = /\bauthenticator\.(?:check|verify|keyuri|generateSecret)\s*\(|\bauthenticator app\b|navigator\.credentials\.(?:create|get)\s*\(/i;
+const WEAK_2FA_TERMS = /hotp|otp|one[-_ ]?time[-_ ]?(?:code|password|passcode|pin)/gi;
+const STRONG_2FA_DEP_RE = /^(?:otplib|@otplib\/[\w-]+|speakeasy|@levminer\/speakeasy|otpauth|node-2fa|2fa-util|totp-generator)$|totp|webauthn|passkey/i;
+// Password sign-in, as opposed to OAuth and email links, where the identity provider holds the second factor.
+const PASSWORD_SIGNIN_RE = /\bsignInWithPassword\s*\(|\bsignInWithEmailAndPassword\s*\(|\bCredentials(?:Provider)?\s*\(\s*\{|['"](?:next-auth|@auth\/core)\/providers\/credentials['"]|\bemailAndPassword\s*:\s*\{[^}]{0,80}\benabled\s*:\s*true|['"]passport-local['"]|\bnew\s+LocalStrategy\s*\(|\b(?:bcrypt|bcryptjs)\.compare(?:Sync)?\s*\(|\bargon2\.verify\s*\(|\b(?:verifyPassword|comparePassword|checkPassword|isPasswordMatch|validatePassword)\s*\(|\bverify\s*\(\s*[\w.$]*(?:password|hash)[\w.$]*\s*,|<input\b[^>]*?\b(?:name|id)\s*=\s*\{?\s*["'`]password["'`]|\bautoComplete\s*=\s*\{?\s*["'`]current-password["'`]/i;
+
+/**
+ * First match of `re` (global, case-insensitive) that is a whole word or a whole camelCase part,
+ * so "mfa" counts in mfaEnabled and verifyMfa but not in a longer word.
+ */
+function termMatch(text, re) {
+  const g = new RegExp(re.source, re.flags);
+  let m;
+  while ((m = g.exec(text))) {
+    const before = text[m.index - 1] || ' ';
+    const after = text[m.index + m[0].length] || ' ';
+    const starts = !/[A-Za-z0-9]/.test(before) || (/[a-z0-9]/.test(before) && /[A-Z]/.test(m[0][0]));
+    if (starts && !/[a-z]/.test(after)) return m;
+    g.lastIndex = m.index + 1; // retry one character on: "signInWithOtp" first matches "hOtp"
+  }
+  return null;
+}
+
+const passwordSignInCache = new WeakMap();
+
+/** Where users sign in with a password, as evidence lines; empty when sign-in is OAuth or email links only. */
+function passwordSignIn(ctx) {
+  const { repo, routes } = ctx;
+  if (passwordSignInCache.has(repo)) return passwordSignInCache.get(repo);
+  const out = [];
+  for (const r of routes) {
+    if (!isWrite(r) || !LOGIN_PATH_RE.test(r.path)) continue;
+    const body = segments(r, { helpers: false }).map((x) => x.text).join('\n');
+    if (/password/i.test(body)) out.push(ev(r.file.rel, r.line, `${routeLabel(r)} signs users in with a password`, repo.snippet(r.file, r.line)));
+  }
+  for (const f of repo.sources({ kinds: ['code', 'markup'], tests: false }).filter((x) => !repo.isTooling(x))) {
+    const m = PASSWORD_SIGNIN_RE.exec(repo.code(f) || '');
+    if (!m) continue;
+    const line = repo.lineOf(f, m.index);
+    if (!repo.suppressed(f, line)) out.push(ev(f.rel, line, 'password sign-in', repo.snippet(f, line)));
+  }
+  for (const l of passwordSetLocations(ctx)) out.push(ev(l.f.rel, l.line, l.label, repo.snippet(l.f, l.line)));
+  const unique = [...new Map(out.map((e) => [e.split(' — ')[0], e])).values()]; // one line per file:line
+  passwordSignInCache.set(repo, unique);
+  return unique;
+}
+
+function twoFactor(ctx) {
+  const { repo, routes } = ctx;
+  const impl = authImplementation(repo, routes);
+  if (!impl) return na('AUTH-2FA', 'no user accounts or sign-in code found');
+  const who = impl.provider === 'custom' ? 'the custom sign-in' : impl.provider;
+  let weak = null;
+  for (const f of repo.sources({ kinds: ['code', 'markup'], tests: false })) {
+    const text = repo.code(f) || '';
+    const m = termMatch(text, STRONG_2FA_TERMS) || STRONG_2FA_CALL_RE.exec(text);
+    if (m) {
+      const line = repo.lineOf(f, m.index);
+      return pass('AUTH-2FA', [ev(f.rel, line, `2FA code path ("${m[0]}") for ${who}`, repo.snippet(f, line))]);
+    }
+    const w = !weak && termMatch(text, WEAK_2FA_TERMS);
+    if (w) weak = { f, line: repo.lineOf(f, w.index), term: w[0] };
+  }
+  const dep = [...repo.deps].find((d) => STRONG_2FA_DEP_RE.test(d));
+  if (dep) return pass('AUTH-2FA', [`2FA dependency installed: ${dep}`]);
+  if (impl.hosted) {
+    return manual('AUTH-2FA', impl.evidence, { question: `Sign-in runs on ${impl.provider}, which turns MFA on in its dashboard rather than in code. Is MFA enabled, and required for admins?` });
+  }
+  const password = passwordSignIn(ctx).slice(0, 3);
+  if (!password.length) {
+    return pass('AUTH-2FA', [...impl.evidence, `No password sign-in found: users sign in through ${who} with OAuth or email links only, so the identity provider (Google, GitHub, the user's inbox) holds the second factor.`]);
+  }
+  if (weak) {
+    return warn('AUTH-2FA', [...password, ev(weak.f.rel, weak.line, `one-time code ("${weak.term}"), but no TOTP, passkey or MFA code`, repo.snippet(weak.f, weak.line))], {
+      question: `Users sign in with a password, and the only second-factor-like code is a one-time code ("${weak.term}"). Is it a second factor checked after the password, or a sign-in or verification code that stands alone?`,
+    });
+  }
+  return warn('AUTH-2FA', [...password, 'No TOTP, passkey/WebAuthn or MFA enrollment or verification code found.']);
+}
+
+// ── AUTH-PW ────────────────────────────────────────────────────────────────
+
+const PASSWORD_SET_PATH_RE = /(?:^|\/)(?:signup|sign-up|register|registration|join|reset[-_]?password|password[-_]?reset|change[-_]?password|set[-_]?password|update[-_]?password|password)(?:\/|$)|^action:(?:sign_?up|register|reset_?password|change_?password|update_?password|set_?password)$/i;
+// Provider SDK calls that set a password; the provider's dashboard holds the policy.
+const MANAGED_PASSWORD_CALLS = [
+  { provider: 'Supabase Auth', re: /\.auth\.signUp\s*\(\s*\{[^}]{0,300}\bpassword\b|\.auth\.updateUser\s*\(\s*\{[^}]{0,300}\bpassword\b/g },
+  { provider: 'Firebase Auth', re: /\b(?:createUserWithEmailAndPassword|updatePassword|confirmPasswordReset)\s*\(/g },
+  { provider: 'Clerk', re: /\bsignUp\.create\s*\(\s*\{[^}]{0,300}\bpassword\b/g },
+  { provider: 'Auth0', re: /\bdbConnections\.signup\s*\(/g },
+];
+const PASSWORD_HASH_RE = /\b(?:bcrypt|bcryptjs)\.hash(?:Sync)?\s*\(|\bargon2\.hash\s*\(|\bscrypt(?:Sync)?\s*\(/g;
+const STRENGTH_RE = /\bzxcvbn\b|@zxcvbn-ts|password-validator|check-password-strength|owasp-password-strength-test|\bisStrongPassword\s*\(|\bpasswordStrength\s*\(/;
+const MIN_LENGTH_RE = /password[\w$"'\]]*[^;\n]{0,120}?(?:\.min(?:Length)?\(\s*|minLength\s*[:=]\s*\{?\s*|minlength\s*=\s*\{?["']?|\.length\s*<=?\s*)(\d{1,3})(?!\d)|minPasswordLength\s*:\s*(\d{1,3})/gi;
+// Character-class rules: (?=.*[A-Z]) lookaheads, and /[A-Z]/, /\d/ or /[^A-Za-z0-9]/ matched against
+// the password. They sit inside regex literals, which comment blanking empties, so this runs on raw text.
+const CHAR_CLASS = String.raw`(?:\[\^?(?=[^\]\n]{0,40}?(?:A-Z|a-z|0-9|\\d|[!@#$%&*]))[^\]\n]{1,40}\]|\\d|\\p\{L[ul]\})`;
+const COMPLEXITY_RE = new RegExp(String.raw`\(\?=\.\*\??${CHAR_CLASS}|\.(?:match|search|regex|matches)\(\s*\/${CHAR_CLASS}[+*]?\/[a-z]*\s*[,)]|\/${CHAR_CLASS}[+*]?\/[a-z]*\.test\(`, 'g');
+const BREACH_RE = /api\.pwnedpasswords\.com|haveibeenpwned|pwnedpasswords|['"]hibp['"]|\bhaveIBeenPwned\s*\(|\bisPwned\s*\(|\bpwnedPassword\s*\(|breached[-_]?passwords?|leaked[-_]?password/i;
+const AUTH_PATH_RE = /(?:^|[/._-])(?:auth|password|passwords|signup|sign-up|register|registration|accounts?|users?|validations?|validators?|identity|credentials)(?:[/._-]|$)|password/i;
+const MAX_LENGTH_RE = /password[\w$"'\]]*[^;\n]{0,120}?(?:\.max(?:Length)?\(\s*|maxLength\s*[:=]\s*\{?\s*|maxlength\s*=\s*\{?["']?|\.length\s*>=?\s*)(\d{1,3})(?!\d)/gi;
+
+const passwordSetCache = new WeakMap();
+
+/** Where passwords get set: { file, line, label, provider } (provider null = the app's own code). */
+function passwordSetLocations({ repo, routes }) {
+  if (passwordSetCache.has(repo)) return passwordSetCache.get(repo);
+  const out = [];
+  passwordSetCache.set(repo, out);
+  const seen = new Set();
+  const add = (f, line, label, provider) => {
+    const key = `${f.rel}:${line}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ f, line, label, provider });
+  };
+  for (const r of routes) {
+    if (!isWrite(r) || !PASSWORD_SET_PATH_RE.test(r.path)) continue;
+    const body = segments(r, { helpers: false }).map((x) => x.text).join('\n');
+    if (!/password/i.test(body)) continue;
+    const managed = MANAGED_PASSWORD_CALLS.find((c) => new RegExp(c.re.source).test(body));
+    add(r.file, r.line, `${routeLabel(r)} sets a password`, managed ? managed.provider : null);
+  }
+  for (const f of repo.sources({ kinds: ['code'], tests: false }).filter((x) => !repo.isTooling(x))) {
+    const text = repo.code(f) || '';
+    for (const c of MANAGED_PASSWORD_CALLS) {
+      for (const m of text.matchAll(c.re)) add(f, repo.lineOf(f, m.index), `${c.provider} sets a password`, c.provider);
+    }
+    if (repo.side(f) === 'client') continue;
+    for (const m of text.matchAll(PASSWORD_HASH_RE)) {
+      if (!/password/i.test(text.slice(m.index, m.index + 120))) continue;
+      add(f, repo.lineOf(f, m.index), 'password is hashed and stored here', null);
+    }
+  }
+  return out;
+}
+
+function passwordPolicy(ctx) {
+  const { repo } = ctx;
+  const locations = passwordSetLocations(ctx);
+  if (!locations.length) return na('AUTH-PW', 'no signup, password-change or reset code that sets passwords found');
+  let strength = null;
+  let breach = null;
+  const caps = [];
+  // Look near the auth flow first, so a user password rule wins over, say, a Zoom meeting password generator.
+  const setters = new Set(locations.map((l) => l.f.rel));
+  const rank = (f) => (setters.has(f.rel) ? 0 : AUTH_PATH_RE.test(f.rel) ? 1 : 2);
+  for (const f of repo.sources({ kinds: ['code', 'markup'], tests: false }).sort((a, b) => rank(a) - rank(b))) {
+    const text = repo.code(f) || '';
+    const at = (index) => repo.lineOf(f, index);
+    if (!strength) {
+      const lib = STRENGTH_RE.exec(text);
+      if (lib) strength = ev(f.rel, at(lib.index), `password strength check (${lib[0].replace(/\s*\($/, '')})`);
+    }
+    if (!strength) {
+      for (const m of text.matchAll(MIN_LENGTH_RE)) {
+        if (Number(m[1] || m[2]) >= 12) {
+          strength = ev(f.rel, at(m.index), `passwords need at least ${m[1] || m[2]} characters`);
+          break;
+        }
+      }
+    }
+    if (!strength && /password/i.test(text)) {
+      const raw = repo.read(f) || '';
+      for (const m of raw.matchAll(COMPLEXITY_RE)) {
+        // Skip commented-out rules (blanked in code()), and rules nowhere near a password.
+        if (text[m.index] !== raw[m.index] || !/password/i.test(raw.slice(Math.max(0, m.index - 300), m.index + 300))) continue;
+        strength = ev(f.rel, at(m.index), 'password complexity rule', repo.snippet(f, at(m.index)));
+        break;
+      }
+    }
+    if (!breach) {
+      const b = BREACH_RE.exec(text);
+      if (b) breach = ev(f.rel, at(b.index), `breached-password screening (${b[0]})`);
+    }
+    for (const m of text.matchAll(MAX_LENGTH_RE)) {
+      const n = Number(m[1]);
+      if (n >= 32) continue;
+      const line = at(m.index);
+      if (!repo.suppressed(f, line)) caps.push(ev(f.rel, line, `passwords are capped at ${n} characters (a cap under 32 breaks passphrases and password managers)`, repo.snippet(f, line)));
+    }
+  }
+  const where = locations.map((l) => ev(l.f.rel, l.line, l.label, repo.snippet(l.f, l.line)));
+  if (strength || breach) {
+    const missing = !strength ? 'Note: no strength check (zxcvbn or a minimum of 12 or more characters).' : !breach ? 'Note: no breached-password screening (Have I Been Pwned).' : null;
+    return pass('AUTH-PW', [strength, breach, missing, ...caps].filter(Boolean));
+  }
+  const own = locations.filter((l) => !l.provider);
+  if (!own.length) {
+    const providers = [...new Set(locations.map((l) => l.provider))].join(', ');
+    const hint = providers.includes('Supabase') ? ' (Supabase: Auth settings, minimum password length and leaked password protection)' : '';
+    return manual('AUTH-PW', [...where, ...caps], { question: `Passwords are set through ${providers}, which keeps password rules in its dashboard. Does it require 12 or more characters and block breached passwords${hint}?` });
+  }
+  return warn('AUTH-PW', [...own.map((l) => ev(l.f.rel, l.line, `${l.label} with no strength check and no breached-password screening`, repo.snippet(l.f, l.line))), ...caps]);
 }
 
 // ── AUTH-03 ────────────────────────────────────────────────────────────────
@@ -556,4 +818,4 @@ async function cookies(ctx) {
   return pass('AUTH-10', ['Auth/session cookies are set with HttpOnly, Secure and SameSite.']);
 }
 
-module.exports = { name: 'auth', ids: IDS, run, PUBLIC_PATH_RE, isPublicPath, isProtected };
+module.exports = { name: 'auth', ids: IDS, run, PUBLIC_PATH_RE, isPublicPath, isProtected, authImplementation };
