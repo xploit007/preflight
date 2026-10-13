@@ -20,6 +20,17 @@ What `/scan` does:
 
 It reports first and never fixes without asking. It doesn't run destructive or active tests. The only network calls are `npm audit` and, when you pass `--url` or `--supabase-url`, a handful of read-only GET requests: the page itself, one CORS probe, the http→https redirect check, and one `?limit=1` read per table.
 
+## Run the scanner standalone
+
+The scanner is plain Node with no dependencies, so it also runs without Claude Code, in CI for example. You get the raw results: nobody reviews the `warn` and `manual` ones, and no `preflight-report.md` is written.
+
+```bash
+git clone https://github.com/xploit007/preflight
+node preflight/scripts/scan.js /path/to/your-app
+```
+
+![The standalone scanner run on the deliberately vulnerable demo app](../assets/demo-standalone.gif)
+
 ## CLI options
 
 ```text

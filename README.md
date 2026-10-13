@@ -4,18 +4,18 @@ The pre-launch checklist for vibe-coded apps. 69 checks, 30 seconds, zero depend
 
 [![GitHub stars](https://img.shields.io/github/stars/xploit007/preflight?style=flat)](https://github.com/xploit007/preflight/stargazers) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A Claude Code plugin and agent skill: deterministic Node scripts find leaked keys, Supabase tables with RLS off, open admin routes, uncapped cloud and AI spend, and SMS sent without consent, then Claude checks the unclear hits and writes a report with `file:line` evidence and a fix for each. It's the 30-second static scan you run before the heavy tools (Cloudflare's security-audit-skill, Strix).
+A Claude Code plugin: install it, run `/scan` in your repo, and deterministic Node scripts find leaked keys, Supabase tables with RLS off, open admin routes, uncapped cloud and AI spend, and SMS sent without consent. Claude then checks the unclear hits and writes `preflight-report.md` with `file:line` evidence and a fix for each. It's the 30-second static scan you run before the heavy tools (Cloudflare's security-audit-skill, Strix).
 
-![preflight scanning a deliberately vulnerable demo app](assets/demo.gif)
+![Installing the preflight plugin with the claude CLI, then running /scan in Claude Code on a deliberately vulnerable demo app](assets/demo.gif)
 
 ## Quick start
 
-```text
-/plugin marketplace add xploit007/preflight
-/plugin install preflight@preflight
+```bash
+claude plugin marketplace add xploit007/preflight
+claude plugin install preflight@preflight
 ```
 
-Then, in any repo:
+Then start Claude Code (`claude`) in any repo and run:
 
 ```text
 /scan
@@ -23,7 +23,7 @@ Then, in any repo:
 /scan --supabase-url https://<project-ref>.supabase.co --supabase-key <anon-key>
 ```
 
-If another plugin also has a `/scan`, use `/preflight:scan`.
+Already inside Claude Code? The same install is `/plugin marketplace add xploit007/preflight`, then `/plugin install preflight@preflight`. If another plugin also has a `/scan`, use `/preflight:scan`.
 
 Or install the agent skill, then ask your agent to run preflight (in Claude Code: `/preflight`):
 

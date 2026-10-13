@@ -115,12 +115,19 @@ test('README install commands match the repo layout', () => {
   const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
   const market = JSON.parse(fs.readFileSync(path.join(ROOT, '.claude-plugin', 'marketplace.json'), 'utf8'));
   const plugin = JSON.parse(fs.readFileSync(path.join(ROOT, '.claude-plugin', 'plugin.json'), 'utf8'));
-  // /plugin marketplace add <owner>/<repo> then /plugin install <plugin>@<marketplace>
-  const install = /\/plugin install ([\w.-]+)@([\w.-]+)/.exec(readme);
-  assert.ok(/\/plugin marketplace add xploit007\/preflight/.test(readme));
-  assert.ok(install, 'README has a /plugin install command');
+  // Quick start opens with the two commands the demo GIF runs: claude plugin marketplace add
+  // <owner>/<repo>, then claude plugin install <plugin>@<marketplace>. The /plugin forms follow.
+  const quick = readme.slice(readme.indexOf('## Quick start')).split('\n## ')[0];
+  const block = /```bash\n([\s\S]*?)```/.exec(quick);
+  assert.ok(block, 'Quick start has a bash block');
+  const [add, inst, ...rest] = block[1].trim().split('\n');
+  assert.equal(add, 'claude plugin marketplace add xploit007/preflight');
+  const install = /^claude plugin install ([\w.-]+)@([\w.-]+)$/.exec(inst);
+  assert.ok(install, `README installs with claude plugin install <plugin>@<marketplace>, got ${inst}`);
+  assert.deepEqual(rest, []);
   assert.equal(install[1], market.plugins[0].name);
   assert.equal(install[2], market.name);
+  assert.ok(quick.includes('`/plugin marketplace add xploit007/preflight`, then `/plugin install preflight@preflight`'), 'the in-app /plugin forms match');
   assert.equal(plugin.name, market.plugins[0].name);
   assert.equal(market.plugins[0].source, './');
   assert.equal(market.plugins[0].repository, 'https://github.com/xploit007/preflight');
@@ -172,9 +179,16 @@ test('the README example finding is real scanner output', () => {
   assert.ok(readme.includes(`\`\`\`text\n${block}\n\`\`\``), 'README shows the SEC-03 block exactly as the scanner prints it');
 });
 
-test('the demo GIF exists, loops, and stays small enough for a README', () => {
-  const gif = fs.readFileSync(path.join(ROOT, 'assets', 'demo.gif'));
-  assert.equal(gif.subarray(0, 6).toString('latin1'), 'GIF89a');
-  assert.ok(gif.includes(Buffer.from('NETSCAPE2.0', 'latin1')), 'loops (NETSCAPE2.0 extension)');
-  assert.ok(gif.length < 8 * 1024 * 1024, `${(gif.length / 1048576).toFixed(1)} MB`);
+test('the demo GIFs exist, loop, and stay small enough for a README', () => {
+  // assets/demo.gif (the README hero) is the plugin flow; the standalone scanner run lives in docs/usage.md.
+  for (const name of ['demo.gif', 'demo-standalone.gif']) {
+    const gif = fs.readFileSync(path.join(ROOT, 'assets', name));
+    assert.equal(gif.subarray(0, 6).toString('latin1'), 'GIF89a', name);
+    assert.ok(gif.includes(Buffer.from('NETSCAPE2.0', 'latin1')), `${name} loops (NETSCAPE2.0 extension)`);
+    assert.ok(gif.length < 6 * 1024 * 1024, `${name}: ${(gif.length / 1048576).toFixed(1)} MB`);
+  }
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  const usage = fs.readFileSync(path.join(ROOT, 'docs', 'usage.md'), 'utf8');
+  assert.ok(!readme.includes('demo-standalone.gif'), 'the README hero is the plugin flow');
+  assert.ok(usage.includes('](../assets/demo-standalone.gif)'), 'docs/usage.md shows the standalone run');
 });
