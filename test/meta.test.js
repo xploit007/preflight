@@ -72,6 +72,8 @@ test('/scan command: description frontmatter, the three steps and the safety rul
   assert.match(cmd, /^---\ndescription: .+\n/);
   assert.ok(cmd.includes('node "${CLAUDE_PLUGIN_ROOT}/scripts/scan.js"'));
   for (const s of ['## Step 1: run the scanner', '## Step 2: judge the warn and manual results', '## Step 3: write preflight-report.md', 'Report first, never fix', 'No destructive or active testing', 'production URLs']) assert.ok(cmd.includes(s), `missing: ${s}`);
+  // Secrets are referred to only by their masked form: an agent once quoted part of a key to show it was a placeholder.
+  assert.ok(cmd.includes('never paste a secret, or any part of one'), 'secrets are never quoted, even in part');
 });
 
 test('claude plugin validate passes (skipped when the claude CLI is not installed)', (t) => {
