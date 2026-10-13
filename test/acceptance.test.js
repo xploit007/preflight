@@ -106,9 +106,9 @@ test('no runtime dependencies: runs from a bare copy of scripts/ with no node_mo
   assert.equal(res2.json.results.length, CHECKS.length);
 });
 
-test('scan of the vulnerable fixture completes in under 30 seconds (the README tagline)', () => {
+test('the deterministic scan of the vulnerable fixture runs in seconds (the README claim)', () => {
   const res = scan(['./fixtures/vulnerable', '--json']);
-  assert.ok(res.ms < 30000, `took ${res.ms}ms`);
+  assert.ok(res.ms < 10000, `took ${res.ms}ms`);
 });
 
 test('README install commands match the repo layout', () => {

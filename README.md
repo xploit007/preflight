@@ -1,10 +1,12 @@
 # preflight
 
-The pre-launch checklist for vibe-coded apps. 69 checks, 30 seconds, zero dependencies.
+The pre-launch checklist for vibe-coded apps. 69 checks, zero dependencies.
 
 [![GitHub stars](https://img.shields.io/github/stars/xploit007/preflight?style=flat)](https://github.com/xploit007/preflight/stargazers) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A Claude Code plugin: install it, run `/scan` in your repo, and deterministic Node scripts find leaked keys, Supabase tables with RLS off, open admin routes, uncapped cloud and AI spend, and SMS sent without consent. Claude then checks the unclear hits and writes `preflight-report.md` with `file:line` evidence and a fix for each. It's the 30-second static scan you run before the heavy tools (Cloudflare's security-audit-skill, Strix).
+
+The deterministic scan runs in seconds; Claude's full `/scan` review, adjudicating the unclear hits, takes a few minutes.
 
 ![Installing the preflight plugin with the claude CLI, then running /scan in Claude Code on a deliberately vulnerable demo app](assets/demo.gif)
 
